@@ -1,0 +1,3 @@
+[submodule "Legacy-SW"]
+	path = Legacy-SW
+	url = https://github.com/novelda/Legacy-SW.git
