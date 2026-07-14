@@ -1,0 +1,67 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "MXS"
+version = "0.1.0"
+description = "A Modern Unofficial XeThru X4M200 SDK"
+readme = "README.md"
+requires-python = ">=3.14"
+license = "GPLv3"
+authors = [{ name = "Nkjcqvcpi" }]
+dependencies = [
+  "numpy>=2.4.0",
+  "pyserial>=3.5",
+]
+
+[project.scripts]
+x4cir = "x4cir.cli:main"
+
+[dependency-groups]
+dev = [
+  "hypothesis>=6.140",
+  "pyright>=1.1.400",
+  "pytest>=9.0",
+  "pytest-asyncio>=1.0",
+  "pytest-cov>=7.0",
+  "pytest-timeout>=2.4",
+  "ruff>=0.12",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/x4cir"]
+
+[tool.hatch.build]
+exclude = [
+  "/Legacy-SW",
+  "/.venv",
+  "/.DS_Store",
+  "/plan.md",
+  "/tests/golden/fixtures/*.mcpbin",
+]
+
+[tool.pytest.ini_options]
+addopts = "--strict-config --strict-markers --cov=x4cir --cov-report=term-missing --cov-fail-under=80"
+testpaths = ["tests"]
+markers = [
+  "hardware: requires a connected X4M200",
+  "soak: long-running acquisition test",
+]
+timeout = 30
+asyncio_mode = "strict"
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+extend-exclude = ["Legacy-SW"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+
+[tool.pyright]
+include = ["src", "tests", "examples", "scripts"]
+exclude = ["Legacy-SW"]
+typeCheckingMode = "strict"
+pythonVersion = "3.14"
+reportMissingTypeStubs = false

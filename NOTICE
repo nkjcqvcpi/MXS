@@ -1,0 +1,11 @@
+# Notices
+
+The wire-protocol implementation was derived from the local Novelda XeThru
+MCPWrapper reference source in `Legacy-SW/MCPWrapper/mcp_wrapper_1.3.1`.
+
+Copyright 2018 Novelda AS. The reference MCPWrapper is distributed under the
+MIT License. Its full license is available at
+`Legacy-SW/MCPWrapper/mcp_wrapper_1.3.1/LICENSE.md`.
+
+No ModuleConnector binary or source is incorporated into the `x4cir` package.
+
