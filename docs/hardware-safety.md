@@ -13,5 +13,6 @@ The following operations are disabled unless their exact gate is `1`:
 | Raw register write | `MXS_ENABLE_RAW_REGISTER_WRITES` |
 | Frame injection | `MXS_ENABLE_FRAME_INJECTION` |
 | Manufacturing test | `MXS_ENABLE_MANUFACTURING_TESTS` |
+| Noisemap flash store or deletion | `MXS_ENABLE_NOISEMAP_FLASH_WRITE` |
 
 Do not enable a gate while streaming. Do not guess register addresses, test codes, bootloader keys, or safe alternative values. Default hardware tests never store or delete a noisemap, mutate files, enter a bootloader, reset factory state, inject frames, or write registers.

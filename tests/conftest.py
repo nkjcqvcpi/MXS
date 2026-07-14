@@ -19,14 +19,17 @@ class FakeSerial:
         partial_write: int = 4,
         initial_stream: bool = True,
         data_before_ack: bool = True,
+        emit_start_frame: bool = True,
     ) -> None:
         self.baudrate = baudrate
         self.partial_read = partial_read
         self.partial_write = partial_write
         self.data_before_ack = data_before_ack
+        self.emit_start_frame = emit_start_frame
         self.closed = False
         self.disconnected = False
         self.reject_next = False
+        self.suppress_next_response = False
         self.delay_ack = 0.0
         self.writes: list[bytes] = []
         self._incoming: deque[int] = deque(SLEEP_FRAME if initial_stream else b"")
@@ -58,6 +61,9 @@ class FakeSerial:
         return len(chunk)
 
     def _respond(self, packet: bytes) -> None:
+        if self.suppress_next_response:
+            self.suppress_next_response = False
+            return
         if self.delay_ack:
             time.sleep(self.delay_ack)
         if packet == build_ping():
@@ -71,7 +77,9 @@ class FakeSerial:
             b"\xa0\x12\x00\x00\x00\x00\x2a\x00\x00\x00\x04\x00\x00\x00"
             + b"\x00\x00\x80?\x00\x00\x00@\x00\x00@@\x00\x00\x80@"
         )
-        if packet == build_set_fps(17.0) and self.data_before_ack:
+        if packet == build_set_fps(17.0) and not self.emit_start_frame:
+            self.inject(response)
+        elif packet == build_set_fps(17.0) and self.data_before_ack:
             self.inject(frame + response)
         elif packet == build_set_fps(17.0):
             self.inject(response + frame)

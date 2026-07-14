@@ -1,10 +1,10 @@
 """Bounded typed message topics for synchronous and asynchronous consumers."""
 
 import asyncio
-import queue
 import threading
+import time
+from collections import deque
 from collections.abc import AsyncIterator, Iterator
-from contextlib import suppress
 from typing import Literal
 
 from .errors import MessageQueueOverflowError, WorkerTerminatedError
@@ -22,90 +22,115 @@ class Subscription[T]:
     ) -> None:
         if capacity <= 0:
             raise ValueError("subscription capacity must be positive")
-        self._queue: queue.Queue[T | BaseException] = queue.Queue(capacity)
+        self._capacity = capacity
+        self._queue: deque[T | BaseException] = deque()
         self.overflow_policy = overflow_policy
         self.block_timeout = block_timeout
         self.dropped = 0
         self.closed = False
         self._async_waiters: list[tuple[asyncio.AbstractEventLoop, asyncio.Future[T]]] = []
         self._lock = threading.Lock()
+        self._available = threading.Condition(self._lock)
 
     def publish(self, message: T) -> None:
-        if self.closed:
-            return
         waiter: tuple[asyncio.AbstractEventLoop, asyncio.Future[T]] | None = None
         with self._lock:
+            if self.closed:
+                return
             while self._async_waiters and waiter is None:
                 candidate = self._async_waiters.pop(0)
                 if not candidate[1].done():
                     waiter = candidate
-        if waiter is not None:
-            loop, future = waiter
-            loop.call_soon_threadsafe(self._complete_waiter, future, message)
-            return
-        try:
-            self._queue.put_nowait(message)
-        except queue.Full:
-            self._overflow(message)
+            if waiter is None:
+                self._enqueue_locked(message)
+                return
+        loop, future = waiter
+        loop.call_soon_threadsafe(self._complete_waiter, future, message)
 
-    def _overflow(self, message: T) -> None:
+    def _enqueue_locked(self, message: T) -> None:
+        if len(self._queue) < self._capacity:
+            self._queue.append(message)
+            self._available.notify()
+            return
         if self.overflow_policy == "error":
             error = MessageQueueOverflowError("typed message subscription overflow")
-            self.fail(error)
+            self._fail_locked(error)
             raise error
         if self.overflow_policy == "drop_newest":
             self.dropped += 1
             return
         if self.overflow_policy == "block_with_timeout":
-            try:
-                self._queue.put(message, timeout=self.block_timeout)
-                return
-            except queue.Full:
+            deadline = time.monotonic() + self.block_timeout
+            while len(self._queue) >= self._capacity and not self.closed:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._available.wait(remaining)
+            if len(self._queue) >= self._capacity:
                 error = MessageQueueOverflowError("typed message subscription block timed out")
-                self.fail(error)
-                raise error from None
-        with suppress(queue.Empty):
-            self._queue.get_nowait()
+                self._fail_locked(error)
+                raise error
+            self._queue.append(message)
+            self._available.notify()
+            return
+        self._queue.popleft()
         self.dropped += 1
-        self._queue.put_nowait(message)
+        self._queue.append(message)
+        self._available.notify()
 
-    @staticmethod
-    def _complete_waiter(future: asyncio.Future[T], message: T) -> None:
-        if not future.done():
+    def _complete_waiter(self, future: asyncio.Future[T], message: T) -> None:
+        if future.done():
+            self.publish(message)
+        else:
             future.set_result(message)
 
     def peek(self) -> T | None:
-        with self._queue.mutex:
-            if not self._queue.queue:
+        with self._lock:
+            if not self._queue:
                 return None
-            item = self._queue.queue[0]
+            item = self._queue[0]
         if isinstance(item, BaseException):
             raise item
         return item
 
     def read(self, timeout: float | None = None) -> T:
-        try:
-            item = self._queue.get(timeout=timeout)
-        except queue.Empty as error:
-            raise TimeoutError("timed out waiting for a message") from error
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._available:
+            while not self._queue:
+                if self.closed:
+                    raise WorkerTerminatedError("message subscription is closed")
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    raise TimeoutError("timed out waiting for a message")
+                self._available.wait(remaining)
+            item = self._queue.popleft()
+            self._available.notify_all()
         if isinstance(item, BaseException):
             raise item
         return item
 
     async def read_async(self, timeout: float | None = None) -> T:
-        with suppress(queue.Empty):
-            item = self._queue.get_nowait()
-            if isinstance(item, BaseException):
-                raise item
-            return item
         loop = asyncio.get_running_loop()
         future: asyncio.Future[T] = loop.create_future()
         with self._lock:
-            if self.closed:
-                raise WorkerTerminatedError("message subscription is closed")
-            self._async_waiters.append((loop, future))
+            if self._queue:
+                item = self._queue.popleft()
+                self._available.notify_all()
+            else:
+                if self.closed:
+                    raise WorkerTerminatedError("message subscription is closed")
+                self._async_waiters.append((loop, future))
+                item = None
+        if item is not None:
+            if isinstance(item, BaseException):
+                raise item
+            return item
         try:
             return await asyncio.wait_for(future, timeout)
+        except asyncio.CancelledError:
+            if future.done() and not future.cancelled():
+                self.publish(future.result())
+            raise
         finally:
             with self._lock:
                 self._async_waiters = [
@@ -124,21 +149,23 @@ class Subscription[T]:
             yield await self.read_async()
 
     def fail(self, error: BaseException) -> None:
-        if self.closed:
-            return
-        self.closed = True
-        while True:
-            with suppress(queue.Empty):
-                self._queue.get_nowait()
-                continue
-            break
-        with suppress(queue.Full):
-            self._queue.put_nowait(error)
         with self._lock:
-            waiters = self._async_waiters
-            self._async_waiters = []
+            waiters = self._fail_locked(error)
         for loop, future in waiters:
             loop.call_soon_threadsafe(self._fail_waiter, future, error)
+
+    def _fail_locked(
+        self, error: BaseException
+    ) -> list[tuple[asyncio.AbstractEventLoop, asyncio.Future[T]]]:
+        if self.closed:
+            return []
+        self.closed = True
+        self._queue.clear()
+        self._queue.append(error)
+        waiters = self._async_waiters
+        self._async_waiters = []
+        self._available.notify_all()
+        return waiters
 
     @staticmethod
     def _fail_waiter(future: asyncio.Future[T], error: BaseException) -> None:
@@ -192,6 +219,7 @@ class MessageHub:
         "noisemap_float",
         "noisemap_byte",
         "raw_rf",
+        "raw_iq",
         "system",
         "unknown",
         "all",
@@ -209,6 +237,7 @@ class MessageHub:
     noisemap_float: Topic[object]
     noisemap_byte: Topic[object]
     raw_rf: Topic[object]
+    raw_iq: Topic[object]
     system: Topic[object]
     unknown: Topic[object]
     all: Topic[object]

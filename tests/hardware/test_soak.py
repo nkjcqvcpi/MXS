@@ -27,9 +27,10 @@ def test_thirty_minute_soak(tmp_path: Path) -> None:
         X4M200(
             port=os.environ["MXS_TEST_PORT"],
             frame_queue_size=256,
-            raw_chunk_callback=recorder.write_chunk,
+            wire_chunk_callback=recorder.write_chunk,
         ) as radar,
     ):
+        recorder.set_fatal_callback(radar.recording_failed)
         radar.configure(X4Config())
         radar.start()
         while time.monotonic() - started < duration:

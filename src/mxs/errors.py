@@ -8,26 +8,23 @@ class MxsError(Exception):
 
 
 # 0.1 name retained for source compatibility.
-X4CirError = MxsError
-
-
-class SerialOpenError(X4CirError):
+class SerialOpenError(MxsError):
     pass
 
 
-class DeviceNotFoundError(X4CirError):
+class DeviceNotFoundError(MxsError):
     pass
 
 
-class DeviceDisconnectedError(X4CirError):
+class DeviceDisconnectedError(MxsError):
     pass
 
 
-class BaudDetectionError(X4CirError):
+class BaudDetectionError(MxsError):
     pass
 
 
-class ProtocolError(X4CirError):
+class ProtocolError(MxsError):
     pass
 
 
@@ -43,12 +40,12 @@ class MalformedMessageError(ProtocolError):
     pass
 
 
-class CommandTimeoutError(X4CirError):
+class CommandTimeoutError(MxsError):
     pass
 
 
 @dataclass(slots=True)
-class CommandRejectedError(X4CirError):
+class CommandRejectedError(MxsError):
     command_name: str
     packet: bytes
     firmware_error_code: int
@@ -64,19 +61,19 @@ class CommandRejectedError(X4CirError):
         )
 
 
-class InvalidDeviceStateError(X4CirError):
+class InvalidDeviceStateError(MxsError):
     pass
 
 
-class InvalidIqFrameError(X4CirError):
+class InvalidIqFrameError(MxsError):
     pass
 
 
-class FrameBackpressureError(X4CirError):
+class FrameBackpressureError(MxsError):
     pass
 
 
-class WorkerTerminatedError(X4CirError):
+class WorkerTerminatedError(MxsError):
     pass
 
 

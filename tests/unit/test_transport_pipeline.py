@@ -3,9 +3,15 @@ import time
 import pytest
 
 from mxs.diagnostics import StatisticsTracker
-from mxs.errors import FrameBackpressureError
+from mxs.errors import (
+    FrameBackpressureError,
+    RecordingBackpressureError,
+    SerialOpenError,
+    WorkerTerminatedError,
+)
 from mxs.router import CommandManager, MessageRouter
-from mxs.transport import DecoderWorker, RawCallbackWorker
+from mxs.transport import DecoderWorker, RawCallbackWorker, SerialWorker, WireChunk
+from tests.conftest import FakeSerial
 
 
 def make_router() -> MessageRouter:
@@ -37,14 +43,54 @@ def test_decoder_and_raw_callback_backpressure() -> None:
     decoder.submit(b"\x50")
     with pytest.raises(FrameBackpressureError):
         decoder.submit(b"\x50")
-    received: list[bytes] = []
-    raw = RawCallbackWorker(received.append, router.statistics, capacity=1)
-    raw.submit(b"one")
-    with pytest.raises(FrameBackpressureError):
-        raw.submit(b"two")
+    received: list[WireChunk] = []
+    raw = RawCallbackWorker(received.append, router.statistics, lambda _error: None, capacity=1)
+    raw.submit(WireChunk(1, "rx", b"one"))
+    with pytest.raises(RecordingBackpressureError):
+        raw.submit(WireChunk(2, "rx", b"two"))
     raw.start()
     deadline = time.monotonic() + 1
     while not received and time.monotonic() < deadline:
         time.sleep(0.001)
-    raw.close()
-    assert received == [b"one"]
+    with pytest.raises(RecordingBackpressureError):
+        raw.close()
+    assert received == [WireChunk(1, "rx", b"one")]
+
+
+def test_real_serial_constructor_and_exclusive_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    router = make_router()
+    calls = 0
+
+    def serial_constructor(**kwargs: object) -> FakeSerial:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise TypeError("exclusive unsupported")
+        baudrate = kwargs["baudrate"]
+        assert isinstance(baudrate, int)
+        return FakeSerial(baudrate, initial_stream=False)
+
+    monkeypatch.setattr("mxs.transport.serial.Serial", serial_constructor)
+    worker = SerialWorker("fake", 115200, router, router.statistics)
+    opened = worker._open_serial()  # pyright: ignore[reportPrivateUsage]
+    assert opened.baudrate == 115200
+    assert calls == 2
+
+
+def test_transport_request_timeouts_and_open_failure() -> None:
+    router = make_router()
+    idle = SerialWorker("fake", 115200, router, router.statistics)
+    with pytest.raises(WorkerTerminatedError, match="write"):
+        idle.send(b"packet", timeout=0.001)
+    with pytest.raises(WorkerTerminatedError, match="baud"):
+        idle.set_baudrate(921600, timeout=0.001)
+
+    def fail_open(_port: str, _baudrate: int) -> FakeSerial:
+        raise OSError("open failed")
+
+    failed = SerialWorker("fake", 115200, router, router.statistics, serial_factory=fail_open)
+    with pytest.raises(SerialOpenError, match="open failed"):
+        failed.start()
+    failed.close()

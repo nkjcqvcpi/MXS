@@ -18,7 +18,7 @@ If communication fails after a baud transition, close every process holding
 the device and probe again with automatic detection. If streaming fails, send
 STOP, enter MANUAL mode, and configure from a new session. USB disconnects are
 reported to every pending reader. The same object may be closed and reopened
-after the device re-enumerates. After an ACK timeout, call `recover()`; do not
+after the device re-enumerates. After any command timeout, call `recover()`; do not
 send another command on the old transport.
 
 Hardware and soak tests are explicit:

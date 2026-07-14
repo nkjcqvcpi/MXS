@@ -202,11 +202,10 @@ class CommandManager:
                 if not ready or response is None:
                     self._statistics.add("command_timeouts")
                     error = CommandTimeoutError(f"{name} timed out after {elapsed:.3f}s")
-                    if expectation.response_class is Ack:
-                        self._desynchronized = True
-                        desync_error = SessionDesynchronizedError(str(error))
-                        if self._desynchronize is not None:
-                            self._desynchronize(desync_error)
+                    self._desynchronized = True
+                    desync_error = SessionDesynchronizedError(str(error))
+                    if self._desynchronize is not None:
+                        self._desynchronize(desync_error)
                     raise error
                 response = cast(Ack | ErrorResponse | Reply | Pong | BaseException, response)
                 if isinstance(response, BaseException):
@@ -257,6 +256,7 @@ class MessageRouter:
         self.events: queue.Queue[Message] = queue.Queue(256)
         self.unknown: queue.Queue[UnknownMessage] = queue.Queue(64)
         self.last_counter: int | None = None
+        self.last_counter_by_stream: dict[tuple[type[object], int], int] = {}
         self.valid_packet_count = 0
         self.content_ids: set[int] = set()
         self.message_types: set[str] = set()
@@ -275,12 +275,21 @@ class MessageRouter:
         self.message_types.add(type(message).__name__)
         if self.command_manager.route(message, raw_payload):
             return
+        if isinstance(message, (Ack, ErrorResponse, Reply, Pong)):
+            LOGGER.debug("discarding uncorrelated control response %s", type(message).__name__)
+            return
+        application_counter = getattr(message, "frame_counter", None)
+        if isinstance(application_counter, int) and not isinstance(
+            message, (DataFloatMessage, BasebandIqMessage)
+        ):
+            content_id = getattr(message, "content_id", 0)
+            self.last_counter_by_stream[(type(message), int(content_id))] = application_counter
         if isinstance(message, DataFloatMessage):
             self.content_ids.add(message.content_id)
             mode: Literal["rf", "iq"] = "iq" if self._downconversion() else "rf"
             samples = data_float_to_iq(message) if mode == "iq" else message.samples
             self._publish_frame(message.frame_counter, message.content_id, mode, samples)
-            self.messages.publish("raw_rf", message)
+            self.messages.publish("raw_iq" if mode == "iq" else "raw_rf", message)
         elif isinstance(message, BasebandIqMessage):
             self.content_ids.add(message.content_id)
             self._publish_frame(message.frame_counter, message.content_id, "iq", message.samples)
@@ -312,7 +321,6 @@ class MessageRouter:
         else:
             if isinstance(message, SleepStatus):
                 self.content_ids.add(0x2375A16C)
-                self.last_counter = message.frame_counter
                 self.messages.publish("sleep", message)
             else:
                 self.messages.publish(
@@ -327,14 +335,13 @@ class MessageRouter:
         mode: Literal["rf", "iq"],
         samples: NDArray[np.float32] | NDArray[np.complex64],
     ) -> None:
-        gap = (
-            0
-            if self.last_counter is None
-            else max(0, (counter - self.last_counter - 1) & 0xFFFFFFFF)
-        )
+        key = (DataFloatMessage if content_id == 0 else BasebandIqMessage, content_id)
+        previous = self.last_counter_by_stream.get(key)
+        gap = 0 if previous is None else max(0, (counter - previous - 1) & 0xFFFFFFFF)
         if gap > 0x7FFFFFFF:
             gap = 0
         self.last_counter = counter
+        self.last_counter_by_stream[key] = counter
         self.statistics.add("frames_received")
         self.statistics.add("frame_counter_gaps", gap)
         frame = CirFrame(
@@ -378,3 +385,7 @@ class MessageRouter:
         for subscription in subscriptions:
             subscription.fail(error)
         self.messages.fail(error)
+
+    def reset_frame_counters(self) -> None:
+        self.last_counter = None
+        self.last_counter_by_stream.clear()

@@ -1,4 +1,6 @@
 import asyncio
+import threading
+import time
 
 import pytest
 
@@ -29,6 +31,40 @@ def test_subscription_policies_and_iteration() -> None:
         errors.read()
     with pytest.raises(ValueError):
         Subscription[int](0, "error")
+    with pytest.raises(TimeoutError):
+        Subscription[int](1, "error").read(0.001)
+
+
+def test_blocking_subscription_unblocks_when_reader_makes_space() -> None:
+    subscription = Subscription[int](1, "block_with_timeout", block_timeout=0.2)
+    subscription.publish(1)
+    received: list[int] = []
+
+    def delayed_read() -> None:
+        time.sleep(0.01)
+        received.append(subscription.read())
+
+    reader = threading.Thread(target=delayed_read)
+    reader.start()
+    subscription.publish(2)
+    reader.join()
+    assert received == [1]
+    assert subscription.read() == 2
+    subscription.fail(RuntimeError("closed"))
+    subscription.fail(RuntimeError("ignored"))
+    with pytest.raises(RuntimeError, match="closed"):
+        subscription.peek()
+    subscription.publish(3)
+
+
+@pytest.mark.asyncio
+async def test_async_iteration_and_closed_read() -> None:
+    subscription = Subscription[int](1, "error")
+    subscription.publish(9)
+    assert await anext(subscription.__aiter__()) == 9
+    subscription.fail(WorkerTerminatedError("done"))
+    with pytest.raises(WorkerTerminatedError):
+        await subscription.read_async()
 
 
 @pytest.mark.asyncio
@@ -59,3 +95,28 @@ def test_message_hub_routes_all_and_unknown() -> None:
     hub.fail(RuntimeError("failed"))
     with pytest.raises(RuntimeError):
         hub.system.read()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_selected_waiter_preserves_message() -> None:
+    subscription = Subscription[int](2, "error")
+    pending = asyncio.create_task(subscription.read_async())
+    await asyncio.sleep(0)
+    subscription.publish(17)
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    await asyncio.sleep(0)
+    assert await subscription.read_async(1) == 17
+
+
+@pytest.mark.asyncio
+async def test_publish_read_stress_10000() -> None:
+    subscription = Subscription[int](10_000, "error")
+    publisher = threading.Thread(
+        target=lambda: [subscription.publish(value) for value in range(10_000)]
+    )
+    publisher.start()
+    received = [await subscription.read_async(2) for _ in range(10_000)]
+    publisher.join()
+    assert received == list(range(10_000))

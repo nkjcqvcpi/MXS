@@ -3,9 +3,10 @@
 import logging
 import queue
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Protocol, cast
+from typing import Literal, Protocol, cast
 
 import serial
 
@@ -14,6 +15,7 @@ from .diagnostics import StatisticsTracker
 from .errors import (
     DeviceDisconnectedError,
     FrameBackpressureError,
+    RecordingBackpressureError,
     SerialOpenError,
     WorkerTerminatedError,
 )
@@ -49,6 +51,13 @@ class BaudRequest:
 
 Request = WriteRequest | BaudRequest
 SerialFactory = Callable[[str, int], SerialLike]
+
+
+@dataclass(frozen=True, slots=True)
+class WireChunk:
+    timestamp_monotonic_ns: int
+    direction: Literal["rx", "tx"]
+    data: bytes
 
 
 class DecoderWorker:
@@ -129,13 +138,15 @@ class RawCallbackWorker:
 
     def __init__(
         self,
-        callback: Callable[[bytes], None],
+        callback: Callable[[WireChunk], None],
         statistics: StatisticsTracker,
+        fatal_callback: Callable[[BaseException], None],
         capacity: int = 256,
     ) -> None:
         self.callback = callback
         self.statistics = statistics
-        self.queue: queue.Queue[bytes] = queue.Queue(capacity)
+        self.fatal_callback = fatal_callback
+        self.queue: queue.Queue[WireChunk] = queue.Queue(capacity)
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="mxs-raw-writer", daemon=False)
         self.error: BaseException | None = None
@@ -143,12 +154,17 @@ class RawCallbackWorker:
     def start(self) -> None:
         self._thread.start()
 
-    def submit(self, chunk: bytes) -> None:
+    def submit(self, chunk: WireChunk) -> None:
+        if self.error is not None:
+            raise self.error
         try:
             self.queue.put_nowait(chunk)
             self.statistics.maximum("raw_callback_high_water_mark", max(1, self.queue.qsize()))
         except queue.Full as error:
-            raise FrameBackpressureError("raw recording queue overflow") from error
+            recording_error = RecordingBackpressureError("raw recording queue overflow")
+            self.error = recording_error
+            self.fatal_callback(recording_error)
+            raise recording_error from error
 
     def close(self, timeout: float = 3.0) -> None:
         self._stop.set()
@@ -168,6 +184,7 @@ class RawCallbackWorker:
                 self.callback(chunk)
         except BaseException as error:
             self.error = error
+            self.fatal_callback(error)
 
 
 class SerialWorker:
@@ -180,6 +197,7 @@ class SerialWorker:
         *,
         serial_factory: SerialFactory | None = None,
         raw_chunk_callback: Callable[[bytes], None] | None = None,
+        wire_chunk_callback: Callable[[WireChunk], None] | None = None,
         tx_capacity: int = 64,
     ) -> None:
         self.port = port
@@ -188,11 +206,19 @@ class SerialWorker:
         self.statistics = statistics
         self.serial_factory = serial_factory
         self.raw_chunk_callback = raw_chunk_callback
+        self.wire_chunk_callback = wire_chunk_callback
         self.decoder = McpStreamDecoder()
         self.decoder_worker = DecoderWorker(router, statistics)
+
+        def dispatch_raw(chunk: WireChunk) -> None:
+            if self.raw_chunk_callback is not None:
+                self.raw_chunk_callback(chunk.data)
+            if self.wire_chunk_callback is not None:
+                self.wire_chunk_callback(chunk)
+
         self.raw_worker = (
-            RawCallbackWorker(raw_chunk_callback, statistics)
-            if raw_chunk_callback is not None
+            RawCallbackWorker(dispatch_raw, statistics, router.fail)
+            if raw_chunk_callback is not None or wire_chunk_callback is not None
             else None
         )
         self._requests: queue.Queue[Request] = queue.Queue(tx_capacity)
@@ -295,11 +321,10 @@ class SerialWorker:
                 received = port.readinto(read_buffer)
                 if received:
                     chunk = bytes(memoryview(read_buffer)[:received])
+                    timestamp = time.monotonic_ns()
                     self.statistics.add("bytes_received", received)
-                    if self.raw_chunk_callback is not None:
-                        if self.raw_worker is None:  # pragma: no cover - constructor invariant
-                            raise RuntimeError("raw callback worker is unavailable")
-                        self.raw_worker.submit(chunk)
+                    if self.raw_worker is not None:
+                        self.raw_worker.submit(WireChunk(timestamp, "rx", chunk))
                     before_classic = self.decoder.statistics.classic_packets
                     before_noescape = self.decoder.statistics.noescape_packets
                     before_crc = self.decoder.statistics.crc_errors
@@ -359,6 +384,8 @@ class SerialWorker:
                             raise DeviceDisconnectedError("serial write returned zero bytes")
                         offset += written
                     port.flush()
+                    if self.raw_worker is not None:
+                        self.raw_worker.submit(WireChunk(time.monotonic_ns(), "tx", request.packet))
                     self.statistics.add("bytes_transmitted", len(view))
                     LOGGER.debug("TX %s", request.packet.hex(" "))
             except BaseException as error:

@@ -45,7 +45,7 @@ Each message topic supports `peek()`, `read()`, `iter()`, `subscribe()`, `read_a
 
 ## Async API
 
-`AsyncX4M200` preserves the 0.1 API. Frame delivery uses `loop.call_soon_threadsafe` and a bounded event-loop queue, not timed polling.
+`AsyncX4M200` bridges the session's single primary lossless subscription into a bounded event-loop queue. Structured interfaces are asynchronous too.
 
 ```python
 from mxs import AsyncX4M200
@@ -53,6 +53,7 @@ from mxs import AsyncX4M200
 async with AsyncX4M200(port=port) as radar:
     await radar.configure(X4Config())
     await radar.start()
+    print(await radar.module.ping())
     frame = await radar.read_frame(timeout=2.0)
 ```
 
@@ -64,9 +65,9 @@ Host processing is opt-in. `mxs.processing` provides IQ/amplitude/phase conversi
 
 ## Safety and firmware
 
-Unsafe namespaces require operation-specific environment gates. Factory reset, bootloader entry, filesystem mutation/formatting, raw register writes, frame injection, and manufacturing tests are disabled by default. See [hardware safety](docs/hardware-safety.md) before enabling any gate.
+Unsafe namespaces require operation-specific environment gates. Factory reset, bootloader entry, filesystem mutation/formatting, raw register writes, frame injection, manufacturing tests, and noisemap flash writes are disabled by default. See [hardware safety](docs/hardware-safety.md) before enabling any gate.
 
-An ACK timeout marks the session desynchronized, closes the transport, and rejects further commands. Call `recover()` to reopen and restore STOP state. A disconnect wakes pending consumers; close and reopen the same object to rebuild workers and subscriptions.
+Any command timeout marks the session desynchronized, closes the transport, and rejects further commands. Call `recover()` to reprobe and restore STOP state. A disconnect wakes pending consumers; close and reopen the same object to rebuild workers and subscriptions.
 
 Firmware-dependent behavior is conservative. Unknown support is never reported as supported, and functions with no local producer or a negative probe raise `UnsupportedFirmwareError`. The tested firmware matrix is in [firmware capabilities](docs/firmware-capabilities.md).
 

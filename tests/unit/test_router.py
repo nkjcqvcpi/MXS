@@ -4,6 +4,7 @@ import time
 import numpy as np
 import pytest
 
+from mxs.constants import CONTENT_ID_NOISEMAP_FLOAT
 from mxs.diagnostics import StatisticsTracker
 from mxs.errors import (
     CommandRejectedError,
@@ -13,7 +14,21 @@ from mxs.errors import (
     SessionDesynchronizedError,
 )
 from mxs.expectations import reply
-from mxs.models import Ack, DataFloatMessage, ErrorResponse, IntReply
+from mxs.models import (
+    Ack,
+    BasebandAmplitudePhaseMessage,
+    DataFloatMessage,
+    ErrorResponse,
+    IntReply,
+    MatrixMessage,
+    NormalizedMovementList,
+    RespirationDetectionList,
+    RespirationMovingList,
+    RespirationStatus,
+    SleepStatus,
+    SystemMessage,
+    VitalSigns,
+)
 from mxs.router import CommandManager, MessageRouter
 
 
@@ -62,6 +77,66 @@ def test_iq_conversion_and_counter_gap() -> None:
     assert first.samples.dtype == np.complex64
     assert second.sequence_gap == 2
     assert statistics.snapshot().frame_counter_gaps == 2
+
+
+def test_application_counter_does_not_change_cir_gap_and_iq_topic() -> None:
+    router, statistics = make_router(True)
+    subscription = router.subscribe(2, "error")
+    router.route(message(10), b"")
+    router.route(SleepStatus(500, 4, 0.0, 0.0, 0, 0.0, 0.0), b"")
+    router.route(message(11), b"")
+    iq_message = router.messages.raw_iq.read()
+    assert isinstance(iq_message, DataFloatMessage)
+    assert iq_message.frame_counter == 10
+    first = subscription.queue.get_nowait()
+    second = subscription.queue.get_nowait()
+    assert not isinstance(first, BaseException) and first.sequence_gap == 0
+    assert not isinstance(second, BaseException) and second.sequence_gap == 0
+    assert statistics.snapshot().frame_counter_gaps == 0
+
+
+def test_typed_application_routes_each_message_once() -> None:
+    router, _statistics = make_router()
+    values = np.asarray([1.0], np.float32)
+    routed = [
+        (
+            BasebandAmplitudePhaseMessage(1, 1, 1, 0.1, 1.0, 7.0, 0.0, values, values),
+            "baseband_ap",
+        ),
+        (RespirationStatus(1, 2, 3, 4.0, 5.0, 6), "respiration"),
+        (RespirationMovingList(1, values, values), "respiration_moving_list"),
+        (RespirationDetectionList(1, values, values, values), "respiration_detection_list"),
+        (NormalizedMovementList(1, 0.0, 0.1, values, values), "normalized_movement"),
+        (
+            VitalSigns(1, 2, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0),
+            "vital_signs",
+        ),
+        (
+            MatrixMessage(
+                CONTENT_ID_NOISEMAP_FLOAT,
+                1,
+                2,
+                3,
+                4,
+                1,
+                5,
+                1.0,
+                1.0,
+                0.0,
+                1.0,
+                2.0,
+                values,
+            ),
+            "noisemap_float",
+        ),
+    ]
+    for message_value, topic in routed:
+        router.route(message_value, b"")
+        assert getattr(router.messages, topic).read() is message_value
+        assert router.messages.all.read() is message_value
+    system = SystemMessage(1, b"x")
+    router.route(system, b"")
+    assert router.messages.system.read() is system
 
 
 def test_commands_are_serialized_and_firmware_error_is_preserved() -> None:

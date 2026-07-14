@@ -94,7 +94,9 @@ def test_module_profile_and_output_interfaces(session: DeviceSession) -> None:
     assert outputs.get_debug_output_control(3) == 1
 
 
-def test_xep_gpio_noisemap_and_parameters(session: DeviceSession) -> None:
+def test_xep_gpio_noisemap_and_parameters(
+    session: DeviceSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
     xep = XepInterface(session)
     xep.x4driver_init()
     xep.x4driver_set_fps(10)
@@ -128,6 +130,9 @@ def test_xep_gpio_noisemap_and_parameters(session: DeviceSession) -> None:
     assert gpio.get_iopin_value(1) == 1
     noisemap = NoisemapInterface(session)
     noisemap.load_noisemap()
+    with pytest.raises(UnsafeOperationDisabledError):
+        noisemap.store_noisemap()
+    monkeypatch.setenv("MXS_ENABLE_NOISEMAP_FLASH_WRITE", "1")
     noisemap.store_noisemap()
     noisemap.set_noisemap_control(3)
     assert noisemap.get_noisemap_control() == 1
@@ -177,6 +182,8 @@ def test_filesystem_and_unsafe_gates(
     unsafe.filesystem_admin.set_file_data(1, 2, 0, b"data")
     unsafe.filesystem_admin.close_file(1, 2, commit=True)
     unsafe.filesystem_admin.set_file(1, 2, b"data")
+    names = [name for name, _packet in cast(StubSession, session).calls]
+    assert names[-3:] == ["create_file", "set_file_data", "close_file"]
     unsafe.filesystem_admin.delete_file(1, 2)
     monkeypatch.setenv("MXS_ENABLE_FRAME_INJECTION", "1")
     unsafe.prepare_inject_frame(1, 2, 0)

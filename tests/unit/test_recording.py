@@ -1,3 +1,4 @@
+import io
 from pathlib import Path
 from typing import cast
 
@@ -5,6 +6,7 @@ import numpy as np
 import pytest
 from numpy.typing import NDArray
 
+from mxs.errors import RecordingBackpressureError
 from mxs.models import CirFrame, DataByteMessage, X4Config
 from mxs.recording import (
     ChunkedCirRecorder,
@@ -12,8 +14,10 @@ from mxs.recording import (
     WireRecorder,
     replay_parsed,
     replay_wire,
+    replay_wire_records,
     save_npz,
 )
+from mxs.transport import WireChunk
 
 # pyright: reportPrivateUsage=false
 
@@ -29,10 +33,14 @@ def test_wire_round_trip_and_truncation(tmp_path: Path) -> None:
         assert recorder.backlog == 0
         assert recorder.queue_high_water_mark == 0
         recorder.write_chunk(b"one")
-        recorder.write_chunk(b"two")
+        recorder.write_chunk(WireChunk(123, "tx", b"command"))
+        recorder.write_chunk(WireChunk(456, "rx", b"two"))
         assert recorder.queue_high_water_mark > 0
     assert list(replay_wire(path)) == [b"one", b"two"]
-    assert recorder.bytes_written == 6
+    records = list(replay_wire_records(path))
+    assert records[1] == WireChunk(123, "tx", b"command")
+    assert records[2] == WireChunk(456, "rx", b"two")
+    assert recorder.bytes_written == 13
     assert recorder.backlog == 0
     path.write_bytes(path.read_bytes()[:-1])
     try:
@@ -41,6 +49,44 @@ def test_wire_round_trip_and_truncation(tmp_path: Path) -> None:
         assert "truncated" in str(error)
     else:
         raise AssertionError("truncated recording was accepted")
+
+
+def test_wire_validation_and_recovery_paths(tmp_path: Path) -> None:
+    recorder = WireRecorder(tmp_path / "closed.mcpbin", "fake", 115200)
+    with pytest.raises(RuntimeError, match="not open"):
+        recorder.write_chunk(b"data")
+    path = tmp_path / "invalid.mcpbin"
+    path.write_bytes(b"wrong")
+    with pytest.raises(ValueError, match="not an mxs"):
+        list(replay_wire_records(path))
+    path.write_bytes(b"X4MCPBIN")
+    with pytest.raises(ValueError, match="header"):
+        list(replay_wire_records(path))
+
+    path = tmp_path / "direction.mcpbin"
+    with (
+        pytest.raises(ValueError, match="direction"),
+        WireRecorder(path, "fake", 115200) as opened,
+    ):
+        opened.write_chunk(b"data", direction="sideways")
+
+
+def test_wire_backpressure_is_fatal(tmp_path: Path) -> None:
+    failures: list[BaseException] = []
+    recorder = WireRecorder(
+        tmp_path / "full.mcpbin",
+        "fake",
+        115200,
+        fatal_callback=failures.append,
+        queue_capacity=1,
+    )
+    recorder._file = io.BytesIO()  # pyright: ignore[reportPrivateUsage]
+    recorder.write_chunk(b"first", timeout=0)
+    with pytest.raises(RecordingBackpressureError):
+        recorder.write_chunk(b"second", timeout=0)
+    assert isinstance(failures[0], RecordingBackpressureError)
+    with pytest.raises(RecordingBackpressureError):
+        recorder.write_chunk(b"third", timeout=0)
 
 
 def test_npz_and_chunked_recording(tmp_path: Path) -> None:

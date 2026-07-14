@@ -6,15 +6,16 @@ import struct
 import threading
 import time
 from base64 import b64decode, b64encode
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import asdict, fields, is_dataclass
 from pathlib import Path
-from typing import BinaryIO, TextIO, cast
+from typing import BinaryIO, Literal, TextIO, cast
 
 import numpy as np
 from numpy.typing import NDArray
 
 from ..models import CirFrame, X4Config
+from ..transport import WireChunk
 
 WIRE_MAGIC = b"X4MCPBIN"
 WIRE_VERSION = 2
@@ -23,7 +24,14 @@ PARSED_VERSION = 1
 
 class WireRecorder:
     def __init__(
-        self, path: Path, port: str, baudrate: int, metadata: dict[str, object] | None = None
+        self,
+        path: Path,
+        port: str,
+        baudrate: int,
+        metadata: dict[str, object] | None = None,
+        *,
+        fatal_callback: Callable[[BaseException], None] | None = None,
+        queue_capacity: int = 256,
     ) -> None:
         self.path = path
         self._file: BinaryIO | None = None
@@ -31,11 +39,15 @@ class WireRecorder:
         self._baudrate = baudrate
         self._metadata = metadata or {}
         self._lock = threading.Lock()
-        self._queue: queue.Queue[tuple[int, bytes] | None] = queue.Queue(256)
+        self._queue: queue.Queue[WireChunk | None] = queue.Queue(queue_capacity)
         self._thread = threading.Thread(target=self._run, name="mxs-wire-writer", daemon=False)
         self._error: BaseException | None = None
         self._bytes_written = 0
         self._queue_high_water_mark = 0
+        self._fatal_callback = fatal_callback
+
+    def set_fatal_callback(self, callback: Callable[[BaseException], None]) -> None:
+        self._fatal_callback = callback
 
     @property
     def bytes_written(self) -> int:
@@ -63,21 +75,32 @@ class WireRecorder:
         self._thread.start()
         return self
 
-    def write_chunk(self, chunk: bytes, *, direction: str = "rx", timeout: float = 1.0) -> None:
+    def write_chunk(
+        self,
+        chunk: WireChunk | bytes,
+        *,
+        direction: str = "rx",
+        timeout: float = 1.0,
+    ) -> None:
         if self._file is None:
             raise RuntimeError("wire recorder is not open")
         if self._error is not None:
             raise self._error
-        code = {"rx": 0, "tx": 1}.get(direction)
-        if code is None:
+        if isinstance(chunk, bytes):
+            chunk = WireChunk(time.monotonic_ns(), cast("Literal['rx', 'tx']", direction), chunk)
+        if chunk.direction not in ("rx", "tx"):
             raise ValueError("direction must be 'rx' or 'tx'")
         try:
-            self._queue.put((code, bytes(chunk)), timeout=timeout)
+            self._queue.put(chunk, timeout=timeout)
             self._queue_high_water_mark = max(self._queue_high_water_mark, 1, self._queue.qsize())
         except queue.Full as error:
             from ..errors import RecordingBackpressureError
 
-            raise RecordingBackpressureError("raw-wire recording queue is full") from error
+            recording_error = RecordingBackpressureError("raw-wire recording queue is full")
+            self._error = recording_error
+            if self._fatal_callback is not None:
+                self._fatal_callback(recording_error)
+            raise recording_error from error
 
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
         if self._file is not None:
@@ -100,19 +123,21 @@ class WireRecorder:
                         assert self._file is not None
                         self._file.write(struct.pack("<QBI", time.monotonic_ns(), 0xFF, 0))
                     return
-                direction, chunk = item
+                code = 0 if item.direction == "rx" else 1
                 with self._lock:
                     assert self._file is not None
                     self._file.write(
-                        struct.pack("<QBI", time.monotonic_ns(), direction, len(chunk))
+                        struct.pack("<QBI", item.timestamp_monotonic_ns, code, len(item.data))
                     )
-                    self._file.write(chunk)
-                    self._bytes_written += len(chunk)
+                    self._file.write(item.data)
+                    self._bytes_written += len(item.data)
         except BaseException as error:
             self._error = error
+            if self._fatal_callback is not None:
+                self._fatal_callback(error)
 
 
-def replay_wire(path: Path, *, recover_truncated: bool = False) -> Iterator[bytes]:
+def replay_wire_records(path: Path, *, recover_truncated: bool = False) -> Iterator[WireChunk]:
     with path.open("rb") as source:
         if source.read(len(WIRE_MAGIC)) != WIRE_MAGIC:
             raise ValueError("not an mxs wire recording")
@@ -132,10 +157,10 @@ def replay_wire(path: Path, *, recover_truncated: bool = False) -> Iterator[byte
                     return
                 raise ValueError("truncated wire record header")
             if version == 1:
-                _timestamp, length = struct.unpack(record_format, header)
+                timestamp, length = struct.unpack(record_format, header)
                 direction = 0
             else:
-                _timestamp, direction, length = struct.unpack(record_format, header)
+                timestamp, direction, length = struct.unpack(record_format, header)
                 if direction == 0xFF and length == 0:
                     return
             chunk = source.read(length)
@@ -143,8 +168,13 @@ def replay_wire(path: Path, *, recover_truncated: bool = False) -> Iterator[byte
                 if recover_truncated:
                     return
                 raise ValueError("truncated wire record")
-            if direction == 0:
-                yield chunk
+            yield WireChunk(timestamp, "rx" if direction == 0 else "tx", chunk)
+
+
+def replay_wire(path: Path, *, recover_truncated: bool = False) -> Iterator[bytes]:
+    for record in replay_wire_records(path, recover_truncated=recover_truncated):
+        if record.direction == "rx":
+            yield record.data
 
 
 def save_npz(

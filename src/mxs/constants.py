@@ -51,8 +51,10 @@ class SystemInfoCode(IntEnum):
     FIRMWARE_ID = 0x02
     VERSION = 0x03
     BUILD = 0x04
-    VERSION_LIST = 0x05
     SERIAL_NUMBER = 0x06
+    VERSION_LIST = 0x07
+    SYSTEM_CORE_ID = 0x08
+    BOOTLOADER = 0x09
 
 
 class ProfileId(IntEnum):
@@ -87,13 +89,18 @@ class NoisemapControl(IntFlag):
 class IoPinSetup(IntFlag):
     INPUT = 0
     OUTPUT = 1
+    PUSH_PULL = 2
+    INVERTED = 4
+    PULL_UP = 8
 
 
-class IoPinFeature(IntFlag):
-    NONE = 0
-    OPEN_DRAIN = 1
-    PULL_UP = 2
-    PULL_DOWN = 4
+class IoPinFeature(IntEnum):
+    DISABLE = 0
+    DEFAULT = 1
+    PASSIVE = 2
+    PRESENCE = 3
+    MOVEMENT = 4
+    BREATHING = 5
 
 
 class X4Parameter(IntEnum):

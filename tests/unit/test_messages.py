@@ -54,6 +54,30 @@ def test_malformed_messages(payload: bytes) -> None:
         decode_message(payload)
 
 
+def test_reply_and_data_edge_variants() -> None:
+    common = struct.pack("<II", 1, 2)
+    assert decode_message(b"\x11\x00" + common).element_count == 0  # type: ignore[union-attr]
+    with pytest.raises(MalformedMessageError, match="NONE"):
+        decode_message(b"\x11\x00" + common + b"\x01")
+    assert decode_message(b"\x11\x11" + common).element_count == 0  # type: ignore[union-attr]
+    assert decode_message(b"\x11\x13" + common + b"\x01").element_count == 0  # type: ignore[union-attr]
+    with pytest.raises(MalformedMessageError, match="unknown REPLY"):
+        decode_message(b"\x11\xff" + common)
+    with pytest.raises(MalformedMessageError, match="UTF-8"):
+        decode_message(b"\x11\x13" + common + struct.pack("<I", 1) + b"\xff\x01")
+    assert decode_message(b"\x11\x10" + common + struct.pack("<I", 1) + b"x\x01").values == b"x"  # type: ignore[union-attr]
+    assert decode_message(b"\x11\x50" + common + struct.pack("<I", 1) + b"y\x01").value == b"y"  # type: ignore[union-attr]
+    with pytest.raises(MalformedMessageError, match="element size"):
+        decode_message(b"\x11\x10" + common + struct.pack("<I", 1) + b"x\x02")
+    assert isinstance(decode_message(b"\xa0\xff"), UnknownMessage)
+    empty_float = decode_message(b"\xa0\x12" + common)
+    assert isinstance(empty_float, DataFloatMessage) and empty_float.samples.size == 0
+    assert decode_message(b"\xa0\x10" + common).data == b""  # type: ignore[union-attr]
+    assert isinstance(decode_message(b"\xa0\x11" + common), UnknownMessage)
+    with pytest.raises(MalformedMessageError, match="DATA STRING"):
+        decode_message(b"\xa0\x13" + common + struct.pack("<I", 1) + b"\xff")
+
+
 def test_baseband_iq_appdata() -> None:
     header = b"\x50" + struct.pack("<IIIffff", CONTENT_ID_BASEBAND_IQ, 8, 2, 0.1, 1.0, 7.29, -0.5)
     payload = header + struct.pack("<ffff", 1.0, 2.0, 3.0, 4.0)

@@ -2,6 +2,8 @@
 
 import os
 import struct
+import threading
+from contextlib import suppress
 from typing import ClassVar, Never
 
 import numpy as np
@@ -56,11 +58,14 @@ from ..constants import (
     CONTENT_ID_LED_CONTROL,
     CONTENT_ID_SENSITIVITY,
     CONTENT_ID_TX_CENTER_FREQUENCY,
+    DeviceState,
+    IoPinFeature,
+    IoPinSetup,
     SensorMode,
     SystemInfoCode,
     X4Parameter,
 )
-from ..errors import UnsafeOperationDisabledError, UnsupportedFirmwareError
+from ..errors import InvalidDeviceStateError, UnsafeOperationDisabledError, UnsupportedFirmwareError
 from ..expectations import ACK, PONG, ResponseExpectation, reply
 from ..models import (
     ByteReply,
@@ -95,15 +100,44 @@ class Interface:
             raise AssertionError("response expectation admitted a non-reply")
         return result
 
+    def _require_unsafe(
+        self,
+        gate: str,
+        *,
+        allowed_states: set[DeviceState],
+        confirmation: bool | None = None,
+    ) -> None:
+        state = getattr(self._session, "state", DeviceState.OPEN)
+        if os.environ.get(gate) != "1":
+            raise UnsafeOperationDisabledError(
+                f"{gate}=1 is required; current state is {state.name}"
+            )
+        if state is DeviceState.STREAMING:
+            raise InvalidDeviceStateError(f"{gate} operation is forbidden while state is STREAMING")
+        if state not in allowed_states:
+            expected = ", ".join(sorted(state.name for state in allowed_states))
+            raise InvalidDeviceStateError(
+                f"{gate} operation requires state {expected}; current state is {state.name}"
+            )
+        worker = getattr(self._session, "worker", None)
+        if hasattr(self._session, "worker") and (worker is None or not worker.alive):
+            raise InvalidDeviceStateError(f"{gate} operation requires a healthy serial session")
+        if confirmation is False:
+            raise ValueError(f"explicit confirmation is required for {gate}")
+
 
 class ModuleInterface(Interface):
     def set_debug_level(self, level: int) -> None:
         self._ack("set_debug_level", build_debug_level(level))
 
     def set_baudrate(self, baudrate: int) -> None:
-        self._session.switch_to_high_baudrate() if baudrate == 921600 else self._ack(
-            "set_baudrate", build_app_set(0x80, struct.pack("<I", baudrate))
-        )
+        switch = getattr(self._session, "switch_baudrate", None)
+        if switch is not None:
+            switch(baudrate)
+        elif baudrate == 921600:
+            self._session.switch_to_high_baudrate()
+        else:
+            raise ValueError("supported baudrates are 115200 and 921600")
 
     def ping(self) -> Pong:
         result = self._execute("ping", build_ping(), PONG)
@@ -391,24 +425,43 @@ class XepInterface(Interface):
 
 
 class GpioInterface(Interface):
-    def set_iopin_control(self, pin: int, setup: int, feature: int) -> None:
-        self._ack("set_iopin_control", build_set_iopin_control(pin, setup, feature))
+    @staticmethod
+    def _pin(pin: int) -> int:
+        if not 0 <= pin <= 0xFFFFFFFF:
+            raise ValueError("pin must be an unsigned 32-bit integer")
+        return pin
 
-    def get_iopin_control(self, pin: int) -> tuple[int, int]:
+    def set_iopin_control(
+        self, pin: int, setup: IoPinSetup | int, feature: IoPinFeature | int
+    ) -> None:
+        setup_value = int(setup)
+        if setup_value & ~0xF:
+            raise ValueError(f"unknown IO pin setup bits: 0x{setup_value & ~0xF:x}")
+        feature_value = int(IoPinFeature(feature))
+        self._ack(
+            "set_iopin_control",
+            build_set_iopin_control(self._pin(pin), setup_value, feature_value),
+        )
+
+    def get_iopin_control(self, pin: int) -> tuple[IoPinSetup, IoPinFeature]:
         result = self._reply(
             "get_iopin_control",
-            build_get_iopin_control(pin),
+            build_get_iopin_control(self._pin(pin)),
             reply(IntReply, 0x11, element_count=2),
         )
         assert isinstance(result, IntReply)
-        return int(result.values[0]), int(result.values[1])
+        return IoPinSetup(int(result.values[0])), IoPinFeature(int(result.values[1]))
 
     def set_iopin_value(self, pin: int, value: int) -> None:
-        self._ack("set_iopin_value", build_set_iopin_value(pin, value))
+        if value not in (0, 1):
+            raise ValueError("IO pin value must be 0 or 1")
+        self._ack("set_iopin_value", build_set_iopin_value(self._pin(pin), value))
 
     def get_iopin_value(self, pin: int) -> int:
         result = self._reply(
-            "get_iopin_value", build_get_iopin_value(pin), reply(IntReply, 0x21, element_count=1)
+            "get_iopin_value",
+            build_get_iopin_value(self._pin(pin)),
+            reply(IntReply, 0x21, element_count=1),
         )
         assert isinstance(result, IntReply)
         return int(result.values[0])
@@ -419,10 +472,17 @@ class NoisemapInterface(Interface):
         self._ack("load_noisemap", build_app_action(0x14))
 
     def store_noisemap(self) -> None:
+        self._require_unsafe(
+            "MXS_ENABLE_NOISEMAP_FLASH_WRITE",
+            allowed_states={DeviceState.OPEN, DeviceState.STOPPED, DeviceState.MANUAL},
+        )
         self._ack("store_noisemap", build_app_action(0x13))
 
     def delete_noisemap(self) -> None:
-        _require_gate("MXS_ENABLE_UNSAFE")
+        self._require_unsafe(
+            "MXS_ENABLE_NOISEMAP_FLASH_WRITE",
+            allowed_states={DeviceState.OPEN, DeviceState.STOPPED, DeviceState.MANUAL},
+        )
         self._ack("delete_noisemap", build_app_action(0x16))
 
     def set_noisemap_control(self, control: int) -> None:
@@ -508,11 +568,6 @@ class FilesystemInterface(Interface):
         return DeviceFile(metadata, self.get_file_data(file_type, identifier, 0, length))
 
 
-def _require_gate(name: str) -> None:
-    if os.environ.get(name) != "1":
-        raise UnsafeOperationDisabledError(f"{name}=1 is required for this operation")
-
-
 class UnsafeInterface(Interface):
     def __init__(self, session: DeviceSession) -> None:
         super().__init__(session)
@@ -520,17 +575,24 @@ class UnsafeInterface(Interface):
         self.filesystem_admin = FilesystemAdminInterface(session)
 
     def start_bootloader(self, *, key: int) -> None:
-        _require_gate("MXS_ENABLE_BOOTLOADER")
+        self._require_unsafe(
+            "MXS_ENABLE_BOOTLOADER", allowed_states={DeviceState.OPEN, DeviceState.STOPPED}
+        )
         self._ack("start_bootloader", build_start_bootloader(key))
 
     def reset_to_factory_preset(self, *, confirm: bool) -> None:
-        _require_gate("MXS_ENABLE_FACTORY_RESET")
-        if not confirm:
-            raise ValueError("confirm=True is required")
+        self._require_unsafe(
+            "MXS_ENABLE_FACTORY_RESET",
+            allowed_states={DeviceState.OPEN, DeviceState.STOPPED},
+            confirmation=confirm,
+        )
         self._ack("reset_to_factory_preset", build_factory_reset())
 
     def system_run_test(self, test_code: int) -> bytes:
-        _require_gate("MXS_ENABLE_MANUFACTURING_TESTS")
+        self._require_unsafe(
+            "MXS_ENABLE_MANUFACTURING_TESTS",
+            allowed_states={DeviceState.OPEN, DeviceState.STOPPED},
+        )
         result = self._reply(
             "system_run_test", build_system_test(test_code), reply(ByteReply, 0x5090)
         )
@@ -538,11 +600,17 @@ class UnsafeInterface(Interface):
         return result.values
 
     def prepare_inject_frame(self, num_frames: int, num_bins: int, mode: int) -> None:
-        _require_gate("MXS_ENABLE_FRAME_INJECTION")
+        self._require_unsafe(
+            "MXS_ENABLE_FRAME_INJECTION",
+            allowed_states={DeviceState.OPEN, DeviceState.STOPPED, DeviceState.MANUAL},
+        )
         self._ack("prepare_inject_frame", build_prepare_inject_frame(num_frames, num_bins, mode))
 
     def inject_frame(self, frame_counter: int, num_bins: int, frame: np.ndarray) -> None:
-        _require_gate("MXS_ENABLE_FRAME_INJECTION")
+        self._require_unsafe(
+            "MXS_ENABLE_FRAME_INJECTION",
+            allowed_states={DeviceState.OPEN, DeviceState.STOPPED, DeviceState.MANUAL},
+        )
         values = np.asarray(frame, dtype="<f4")
         self._ack(
             "inject_frame",
@@ -557,6 +625,12 @@ class UnsafeInterface(Interface):
 
 
 class RegisterInterface(Interface):
+    def _guard_write(self) -> None:
+        self._require_unsafe(
+            "MXS_ENABLE_RAW_REGISTER_WRITES",
+            allowed_states={DeviceState.OPEN, DeviceState.STOPPED, DeviceState.MANUAL},
+        )
+
     def x4driver_get_spi_register(self, address: int) -> int:
         result = self._reply(
             "x4driver_get_spi_register",
@@ -567,21 +641,21 @@ class RegisterInterface(Interface):
         return result.values[0]
 
     def x4driver_set_spi_register(self, address: int, value: int) -> None:
-        _require_gate("MXS_ENABLE_RAW_REGISTER_WRITES")
+        self._guard_write()
         self._ack(
             "x4driver_set_spi_register",
             build_x4_set_register(X4Parameter.SPI_REGISTER, address, value),
         )
 
     def x4driver_set_pif_register(self, address: int, value: int) -> None:
-        _require_gate("MXS_ENABLE_RAW_REGISTER_WRITES")
+        self._guard_write()
         self._ack(
             "x4driver_set_pif_register",
             build_x4_set_register(X4Parameter.PIF_REGISTER, address, value),
         )
 
     def x4driver_set_xif_register(self, address: int, value: int) -> None:
-        _require_gate("MXS_ENABLE_RAW_REGISTER_WRITES")
+        self._guard_write()
         self._ack(
             "x4driver_set_xif_register",
             build_x4_set_register(X4Parameter.XIF_REGISTER, address, value),
@@ -622,7 +696,7 @@ class RegisterInterface(Interface):
         return result.values
 
     def write_spi(self, address: int, values: bytes) -> None:
-        _require_gate("MXS_ENABLE_RAW_REGISTER_WRITES")
+        self._guard_write()
         self._ack("write_spi", build_x4_write(X4Parameter.SPI_REGISTER, bytes((address,)) + values))
 
     x4driver_read_from_spi_register = read_spi
@@ -630,16 +704,37 @@ class RegisterInterface(Interface):
 
 
 class FilesystemAdminInterface(FilesystemInterface):
+    def __init__(self, session: DeviceSession) -> None:
+        super().__init__(session)
+        self._transaction_lock = threading.Lock()
+
+    def _guard(self, gate: str = "MXS_ENABLE_UNSAFE", confirmation: bool | None = None) -> None:
+        self._require_unsafe(
+            gate,
+            allowed_states={DeviceState.OPEN, DeviceState.STOPPED, DeviceState.MANUAL},
+            confirmation=confirmation,
+        )
+
+    @staticmethod
+    def _u32(value: int, name: str) -> int:
+        if not 0 <= value <= 0xFFFFFFFF:
+            raise ValueError(f"{name} must be an unsigned 32-bit integer")
+        return value
+
     def create_file(self, file_type: int, identifier: int, length: int) -> None:
-        _require_gate("MXS_ENABLE_UNSAFE")
+        self._guard()
+        self._u32(length, "length")
         self._ack("create_file", build_filesystem(0x66, file_type, identifier, length))
 
     def open_file(self, file_type: int, identifier: int) -> None:
-        _require_gate("MXS_ENABLE_UNSAFE")
+        self._guard()
         self._ack("open_file", build_filesystem(0x72, file_type, identifier))
 
     def set_file_data(self, file_type: int, identifier: int, offset: int, data: bytes) -> None:
-        _require_gate("MXS_ENABLE_UNSAFE")
+        self._guard()
+        self._u32(offset, "offset")
+        if offset + len(data) > 0xFFFFFFFF:
+            raise ValueError("file write range exceeds uint32")
         for position in range(0, len(data), self.CHUNK_SIZE):
             chunk = data[position : position + self.CHUNK_SIZE]
             self._ack(
@@ -655,23 +750,24 @@ class FilesystemAdminInterface(FilesystemInterface):
             )
 
     def close_file(self, file_type: int, identifier: int, *, commit: bool) -> None:
-        _require_gate("MXS_ENABLE_UNSAFE")
+        self._guard()
         self._ack("close_file", build_filesystem(0x68, file_type, identifier, int(commit)))
 
     def set_file(self, file_type: int, identifier: int, data: bytes) -> None:
-        self.create_file(file_type, identifier, len(data))
-        self.open_file(file_type, identifier)
-        try:
-            self.set_file_data(file_type, identifier, 0, data)
-        except BaseException:
-            self.close_file(file_type, identifier, commit=False)
-            raise
-        self.close_file(file_type, identifier, commit=True)
+        with self._transaction_lock:
+            self.create_file(file_type, identifier, len(data))
+            try:
+                self.set_file_data(file_type, identifier, 0, data)
+            except BaseException:
+                with suppress(BaseException):
+                    self.close_file(file_type, identifier, commit=False)
+                raise
+            self.close_file(file_type, identifier, commit=True)
 
     def format_filesystem(self, *, key: int) -> None:
-        _require_gate("MXS_ENABLE_FILESYSTEM_FORMAT")
+        self._guard("MXS_ENABLE_FILESYSTEM_FORMAT", confirmation=key != 0)
         self._ack("format_filesystem", build_filesystem(0x73, key))
 
     def delete_file(self, file_type: int, identifier: int) -> None:
-        _require_gate("MXS_ENABLE_UNSAFE")
+        self._guard()
         self._ack("delete_file", build_filesystem(0x70, file_type, identifier))

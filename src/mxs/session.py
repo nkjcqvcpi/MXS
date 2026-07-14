@@ -28,7 +28,7 @@ from .errors import BaudDetectionError, InvalidDeviceStateError, WorkerTerminate
 from .expectations import ResponseExpectation
 from .models import Ack, CirFrame, Pong, Reply, SessionStatistics, X4Config
 from .router import CommandManager, FrameSubscription, MessageRouter, QueuePolicy
-from .transport import SerialFactory, SerialWorker
+from .transport import SerialFactory, SerialWorker, WireChunk
 
 LOGGER = logging.getLogger(__name__)
 
@@ -44,6 +44,7 @@ class DeviceSession:
         command_timeout: float = 2.0,
         serial_factory: SerialFactory | None = None,
         raw_chunk_callback: Callable[[bytes], None] | None = None,
+        wire_chunk_callback: Callable[[WireChunk], None] | None = None,
     ) -> None:
         if baudrate != "auto" and baudrate not in (115200, 921600):
             raise ValueError("baudrate must be 'auto', 115200, or 921600")
@@ -53,12 +54,14 @@ class DeviceSession:
         self.command_timeout = command_timeout
         self.serial_factory = serial_factory
         self.raw_chunk_callback = raw_chunk_callback
+        self.wire_chunk_callback = wire_chunk_callback
         self.state = DeviceState.CLOSED
         self.config: X4Config | None = None
         self.statistics_tracker = StatisticsTracker()
         self._frame_queue_size: int = frame_queue_size
         self._overflow_policy: QueuePolicy = overflow_policy
         self._opened_once = False
+        self._reprobe_all_baudrates = False
         self.command_manager: CommandManager
         self.router: MessageRouter
         self.frames: FrameSubscription
@@ -93,7 +96,7 @@ class DeviceSession:
             self._build_runtime()
         candidates = (
             (115200, 921600)
-            if self.requested_baudrate == "auto"
+            if self.requested_baudrate == "auto" or self._reprobe_all_baudrates
             else (int(self.requested_baudrate),)
         )
         failures: list[str] = []
@@ -106,6 +109,7 @@ class DeviceSession:
                 self.statistics_tracker,
                 serial_factory=self.serial_factory,
                 raw_chunk_callback=self.raw_chunk_callback,
+                wire_chunk_callback=self.wire_chunk_callback,
             )
             try:
                 worker.start()
@@ -124,6 +128,7 @@ class DeviceSession:
                 self.detected_baudrate = baudrate
                 self._transition(DeviceState.OPEN)
                 self._opened_once = True
+                self._reprobe_all_baudrates = False
                 LOGGER.info("detected %d baud", baudrate)
                 return
             except BaseException as error:
@@ -159,7 +164,7 @@ class DeviceSession:
         for name, packet in commands:
             self._command(name, packet)
         self._drain_frames(0.1)
-        self.router.last_counter = None
+        self.router.reset_frame_counters()
         self._transition(DeviceState.CONFIGURED)
         LOGGER.info("configured X4M200: %s", config)
 
@@ -167,10 +172,12 @@ class DeviceSession:
         self._require(DeviceState.CONFIGURED)
         if self.config is None:
             raise InvalidDeviceStateError("no X4 configuration is available")
+        self.router.reset_frame_counters()
+        baseline_frames = self.statistics_tracker.snapshot().frames_received
         self._command("START FPS", build_set_fps(self.config.fps))
         self._transition(DeviceState.STREAMING)
         deadline = time.monotonic() + first_frame_timeout
-        while self.frames.queue.empty():
+        while self.statistics_tracker.snapshot().frames_received == baseline_frames:
             if time.monotonic() >= deadline:
                 self.stop()
                 raise WorkerTerminatedError("no CIR frame arrived after starting")
@@ -184,22 +191,35 @@ class DeviceSession:
             if self.state is DeviceState.STREAMING:
                 self._best_effort("FPS 0", build_set_fps(0))
             self._best_effort("STOP", build_set_sensor_mode(SensorMode.STOP))
-        if self.state is not DeviceState.ERROR:
+        if self.state not in (DeviceState.ERROR, DeviceState.DESYNCHRONIZED):
             self._transition(DeviceState.STOPPED)
         LOGGER.info("capture stopped")
 
     def switch_to_high_baudrate(self) -> None:
         """Perform the source-verified 115200 to 921600 transition."""
+        self.switch_baudrate(921600)
+
+    def switch_baudrate(self, baudrate: int) -> None:
+        """Change both ends using the direct command, then verify at the new rate."""
         # Reference: ./Legacy-SW/MCPWrapper/mcp_wrapper_1.3.1/examples/generic/src/main.cpp
+        if baudrate not in (115200, 921600):
+            raise ValueError("supported baudrates are 115200 and 921600")
         self._require(DeviceState.OPEN, DeviceState.STOPPED)
         if self.worker is None:
             raise InvalidDeviceStateError("serial worker is unavailable")
+        if baudrate == self.detected_baudrate:
+            return
         self._command("STOP", build_set_sensor_mode(SensorMode.STOP))
-        self._command("SET BAUD 921600", build_set_baudrate(921600))
-        self.worker.set_baudrate(921600)
+        self._command(f"SET BAUD {baudrate}", build_set_baudrate(baudrate))
+        self.worker.set_baudrate(baudrate)
         time.sleep(0.05)
-        self._command("STOP AT 921600", build_set_sensor_mode(SensorMode.STOP))
-        self.detected_baudrate = 921600
+        try:
+            self.execute("VERIFY BAUD", build_ping(), ResponseExpectation(Pong))
+        except BaseException:
+            self.detected_baudrate = None
+            self._reprobe_all_baudrates = True
+            raise
+        self.detected_baudrate = baudrate
 
     def read_frame(self, timeout: float | None = None) -> CirFrame:
         self._require(DeviceState.STREAMING)
@@ -251,6 +271,10 @@ class DeviceSession:
 
     def statistics(self) -> SessionStatistics:
         return self.statistics_tracker.snapshot()
+
+    def recording_failed(self, error: BaseException) -> None:
+        """Promote an asynchronous recorder failure to a fatal session error."""
+        self.router.fail(error)
 
     def _command(self, name: str, packet: bytes) -> Ack:
         if self.worker is None or not self.worker.alive:

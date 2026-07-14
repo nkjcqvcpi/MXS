@@ -4,6 +4,13 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True, slots=True)
+class CapabilityProbeFailure:
+    operation: str
+    category: str
+    detail: str
+
+
+@dataclass(frozen=True, slots=True)
 class DeviceCapabilities:
     item_number: str | None = None
     order_code: str | None = None
@@ -23,6 +30,7 @@ class DeviceCapabilities:
     supports_device_filesystem: bool | None = None
     supports_bulk_spi: bool | None = None
     supports_frame_injection: bool | None = None
+    probe_failures: tuple[CapabilityProbeFailure, ...] = ()
 
     def supports(self, name: str) -> bool:
         value = getattr(self, name)

@@ -11,14 +11,16 @@ from mxs.commands import (
     build_set_fps,
     build_set_frame_area,
     build_set_frame_area_offset,
+    build_set_iopin_control,
     build_set_iterations,
     build_set_pulses_per_step,
     build_set_sensor_mode,
     build_set_tx_center_frequency,
     build_set_tx_power,
+    build_system_info,
     build_x4_init,
 )
-from mxs.constants import SensorMode
+from mxs.constants import IoPinFeature, IoPinSetup, SensorMode, SystemInfoCode
 
 # Independently transcribed vectors generated from the local C field order and
 # XOR/escaping rules, without calling the Python encoder under test.
@@ -95,3 +97,34 @@ def test_remaining_builders_and_bounds() -> None:
     ):
         with pytest.raises(ValueError):
             call()
+
+
+def test_system_info_gpio_and_baud_golden_vectors() -> None:
+    assert [build_system_info(code).hex() for code in SystemInfoCode] == [
+        "7d905800b57e",
+        "7d905801b47e",
+        "7d905802b77e",
+        "7d905803b67e",
+        "7d905804b17e",
+        "7d905806b37e",
+        "7d905807b27e",
+        "7d905808bd7e",
+        "7d905809bc7e",
+    ]
+    setups = [IoPinSetup.INPUT, *IoPinSetup]
+    assert [build_set_iopin_control(1, setup, 0).hex() for setup in setups] == [
+        "7d40100100000000000000000000002c7e",
+        "7d40100100000001000000000000002d7e",
+        "7d40100100000002000000000000002e7e",
+        "7d4010010000000400000000000000287e",
+        "7d4010010000000800000000000000247e",
+    ]
+    assert [build_set_iopin_control(1, 0, feature).hex() for feature in IoPinFeature] == [
+        "7d40100100000000000000000000002c7e",
+        "7d40100100000000000000010000002d7e",
+        "7d40100100000000000000020000002e7e",
+        "7d40100100000000000000030000002f7e",
+        "7d4010010000000000000004000000287e",
+        "7d4010010000000000000005000000297e",
+    ]
+    assert build_set_baudrate(115200).hex() == "7d908000c20100ae7e"

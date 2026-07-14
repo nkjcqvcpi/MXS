@@ -11,9 +11,18 @@ from pathlib import Path
 
 import numpy as np
 
-from .constants import SensorMode, SystemInfoCode
+from .constants import (
+    IoPinFeature,
+    IoPinSetup,
+    OutputControl,
+    OutputFeature,
+    SensorMode,
+    SystemInfoCode,
+)
 from .device import X4M200
 from .discovery import list_serial_ports
+from .errors import MxsError
+from .message_hub import MessageHub
 from .models import CirFrame, X4Config
 from .recording import ParsedMessageRecorder, WireRecorder, replay_parsed, replay_wire, save_npz
 from .session import DeviceSession
@@ -58,6 +67,41 @@ def _base_parser() -> argparse.ArgumentParser:
         choices=("xep.fps", "xep.iterations", "xep.frame-area", "profile-id", "sensor-mode"),
     )
     _device_options(getter)
+    setter = sub.add_parser("set")
+    setter.add_argument("setting", choices=("xep.fps", "xep.iterations", "profile-id"))
+    setter.add_argument("value")
+    _device_options(setter)
+    outputs = sub.add_parser("outputs")
+    outputs.add_argument("action", choices=("get", "set"))
+    outputs.add_argument("feature", type=lambda value: int(value, 0))
+    outputs.add_argument("control", nargs="?", type=lambda value: int(value, 0))
+    _device_options(outputs)
+    messages = sub.add_parser("messages")
+    messages.add_argument("topic", choices=MessageHub.TOPICS)
+    messages.add_argument("--count", type=int, default=1)
+    _device_options(messages)
+    noisemap = sub.add_parser("noisemap")
+    noisemap.add_argument("action", choices=("load", "get-control", "set-control"))
+    noisemap.add_argument("value", nargs="?", type=lambda value: int(value, 0))
+    _device_options(noisemap)
+    gpio = sub.add_parser("gpio")
+    gpio.add_argument("action", choices=("get-control", "get-value", "set-control", "set-value"))
+    gpio.add_argument("pin", type=lambda value: int(value, 0))
+    gpio.add_argument("values", nargs="*", type=lambda value: int(value, 0))
+    _device_options(gpio)
+    unsafe = sub.add_parser(
+        "unsafe",
+        description=(
+            "Destructive operations require their documented MXS_ENABLE_* environment gate."
+        ),
+    )
+    unsafe.add_argument(
+        "action",
+        choices=("store-noisemap", "delete-noisemap", "factory-reset", "format-filesystem"),
+    )
+    unsafe.add_argument("--key", type=lambda value: int(value, 0), default=0)
+    unsafe.add_argument("--confirm", action="store_true")
+    _device_options(unsafe)
     files = sub.add_parser("files")
     files.add_argument("action", choices=("list",))
     _device_options(files)
@@ -168,8 +212,11 @@ def _record_wire(args: argparse.Namespace) -> int:
         session = DeviceSession(
             args.port,
             baudrate,
-            raw_chunk_callback=recorder.write_chunk,
+            wire_chunk_callback=recorder.write_chunk,
         )
+        failure_handler = getattr(session, "recording_failed", None)
+        if failure_handler is not None:
+            recorder.set_fatal_callback(failure_handler)
         try:
             session.open()
             time.sleep(args.duration)
@@ -245,7 +292,7 @@ def _configured_action(args: argparse.Namespace) -> int:
         elif args.command == "files":
             for item in device.filesystem.find_all_files():
                 print(f"0x{item.file_type:08x}\t0x{item.identifier:08x}")
-        else:
+        elif args.command == "get":
             getters = {
                 "xep.fps": device.xep.x4driver_get_fps,
                 "xep.iterations": device.xep.x4driver_get_iterations,
@@ -254,6 +301,74 @@ def _configured_action(args: argparse.Namespace) -> int:
                 "sensor-mode": device.profile.get_sensor_mode,
             }
             print(getters[args.setting]())
+        elif args.command == "set":
+            setters = {
+                "xep.fps": lambda: device.xep.x4driver_set_fps(float(args.value)),
+                "xep.iterations": lambda: device.xep.x4driver_set_iterations(int(args.value, 0)),
+                "profile-id": lambda: device.profile.load_profile(int(args.value, 0)),
+            }
+            setters[args.setting]()
+        elif args.command == "outputs":
+            feature = OutputFeature(args.feature)
+            if args.action == "get":
+                print(
+                    json.dumps(
+                        {
+                            "feature": feature.name,
+                            "control": int(device.outputs.get_output_control(feature)),
+                        }
+                    )
+                )
+            else:
+                if args.control is None:
+                    raise ValueError("outputs set requires CONTROL")
+                device.outputs.set_output_control(feature, OutputControl(args.control))
+        elif args.command == "messages":
+            subscription = getattr(device.messages, args.topic).subscribe(
+                max(1, args.count), "error"
+            )
+            for _ in range(args.count):
+                message = subscription.read(timeout=5.0)
+                print(
+                    json.dumps(
+                        asdict(message)
+                        if hasattr(message, "__dataclass_fields__")
+                        else {"value": str(message)},
+                        default=str,
+                    )
+                )
+        elif args.command == "noisemap":
+            if args.action == "load":
+                device.noisemap.load_noisemap()
+            elif args.action == "get-control":
+                print(json.dumps({"control": device.noisemap.get_noisemap_control()}))
+            else:
+                if args.value is None:
+                    raise ValueError("noisemap set-control requires VALUE")
+                device.noisemap.set_noisemap_control(args.value)
+        elif args.command == "gpio":
+            if args.action == "get-control":
+                setup, feature = device.gpio.get_iopin_control(args.pin)
+                print(json.dumps({"pin": args.pin, "setup": int(setup), "feature": int(feature)}))
+            elif args.action == "get-value":
+                print(json.dumps({"pin": args.pin, "value": device.gpio.get_iopin_value(args.pin)}))
+            elif args.action == "set-value" and len(args.values) == 1:
+                device.gpio.set_iopin_value(args.pin, args.values[0])
+            elif args.action == "set-control" and len(args.values) == 2:
+                device.gpio.set_iopin_control(
+                    args.pin, IoPinSetup(args.values[0]), IoPinFeature(args.values[1])
+                )
+            else:
+                raise ValueError(f"invalid values for gpio {args.action}")
+        elif args.command == "unsafe":
+            if args.action == "store-noisemap":
+                device.noisemap.store_noisemap()
+            elif args.action == "delete-noisemap":
+                device.noisemap.delete_noisemap()
+            elif args.action == "factory-reset":
+                device.unsafe.reset_to_factory_preset(confirm=args.confirm)
+            else:
+                device.unsafe.filesystem_admin.format_filesystem(key=args.key)
     return 0
 
 
@@ -299,11 +414,30 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "benchmark":
             return _benchmark(args)
-        if args.command in ("profile", "sensor-mode", "get", "files"):
+        if args.command in (
+            "profile",
+            "sensor-mode",
+            "get",
+            "set",
+            "outputs",
+            "messages",
+            "noisemap",
+            "gpio",
+            "unsafe",
+            "files",
+        ):
             return _configured_action(args)
         parser.error("unknown command")
     except KeyboardInterrupt:
         return 130
+    except (MxsError, ValueError, TimeoutError) as error:
+        command = getattr(args, "command", "mxs")
+        print(
+            f"mxs {command} failed: {error}. Close and reopen the device; call recover() "
+            "after a command timeout.",
+            file=sys.stderr,
+        )
+        return 1
     return 2
 
 

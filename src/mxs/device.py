@@ -1,11 +1,11 @@
 """Synchronous public X4M200 API."""
 
 from collections.abc import Callable, Iterator
-from contextlib import suppress
 
-from .capabilities import DeviceCapabilities
+from .capabilities import CapabilityProbeFailure, DeviceCapabilities
 from .constants import DeviceState, SystemInfoCode
 from .discovery import discover_port
+from .errors import CommandRejectedError, CommandTimeoutError, ProtocolError
 from .interfaces import (
     FilesystemInterface,
     GpioInterface,
@@ -20,7 +20,7 @@ from .interfaces import (
 from .models import CirFrame, SessionStatistics, X4Config
 from .router import QueuePolicy
 from .session import DeviceSession
-from .transport import SerialFactory
+from .transport import SerialFactory, WireChunk
 
 
 class X4M200:
@@ -34,6 +34,7 @@ class X4M200:
         command_timeout: float = 2.0,
         serial_factory: SerialFactory | None = None,
         raw_chunk_callback: Callable[[bytes], None] | None = None,
+        wire_chunk_callback: Callable[[WireChunk], None] | None = None,
     ) -> None:
         self._session = DeviceSession(
             port or discover_port(),
@@ -43,6 +44,7 @@ class X4M200:
             command_timeout=command_timeout,
             serial_factory=serial_factory,
             raw_chunk_callback=raw_chunk_callback,
+            wire_chunk_callback=wire_chunk_callback,
         )
         self.module = ModuleInterface(self._session)
         self.profile = ProfileInterface(self._session)
@@ -91,6 +93,9 @@ class X4M200:
     def statistics(self) -> SessionStatistics:
         return self._session.statistics()
 
+    def recording_failed(self, error: BaseException) -> None:
+        self._session.recording_failed(error)
+
     def close(self) -> None:
         self._session.close()
 
@@ -99,6 +104,7 @@ class X4M200:
 
     def probe_capabilities(self) -> DeviceCapabilities:
         values: dict[str, str | None] = {}
+        failures: list[CapabilityProbeFailure] = []
         fields = {
             "item_number": SystemInfoCode.ITEM_NUMBER,
             "order_code": SystemInfoCode.ORDER_CODE,
@@ -111,16 +117,42 @@ class X4M200:
         for field, code in fields.items():
             try:
                 values[field] = self.module.get_system_info(code)
-            except Exception:
+            except (CommandRejectedError, CommandTimeoutError, ProtocolError, ValueError) as error:
                 values[field] = None
+                category = (
+                    "firmware_rejection"
+                    if isinstance(error, CommandRejectedError)
+                    else "timeout"
+                    if isinstance(error, CommandTimeoutError)
+                    else "malformed_reply"
+                )
+                failures.append(CapabilityProbeFailure(field, category, str(error)))
+                if isinstance(error, CommandTimeoutError):
+                    failures.append(
+                        CapabilityProbeFailure(
+                            "remaining_probes",
+                            "not_tested",
+                            "session desynchronized after timeout",
+                        )
+                    )
+                    break
+        for field in fields:
+            values.setdefault(field, None)
         profile_id = None
         sensor_mode = None
-        with suppress(Exception):
-            profile_id = self.profile.get_profileid()
-        with suppress(Exception):
-            sensor_mode = int(self.profile.get_sensor_mode())
-        identity = f"{values.get('firmware_id') or ''} {values.get('order_code') or ''}"
-        is_x4m200 = "X4M200" in identity.upper()
+        if self.state is not DeviceState.DESYNCHRONIZED:
+            try:
+                profile_id = self.profile.get_profileid()
+            except (CommandRejectedError, CommandTimeoutError, ProtocolError, ValueError) as error:
+                failures.append(
+                    CapabilityProbeFailure("profile_id", type(error).__name__, str(error))
+                )
+            try:
+                sensor_mode = int(self.profile.get_sensor_mode())
+            except (CommandRejectedError, CommandTimeoutError, ProtocolError, ValueError) as error:
+                failures.append(
+                    CapabilityProbeFailure("sensor_mode", type(error).__name__, str(error))
+                )
         return DeviceCapabilities(
             item_number=values.get("item_number"),
             order_code=values.get("order_code"),
@@ -131,10 +163,7 @@ class X4M200:
             version_list=values.get("version_list"),
             profile_id=profile_id,
             sensor_mode=sensor_mode,
-            supports_baseband_ap=True if is_x4m200 else None,
-            supports_device_filesystem=True if is_x4m200 else None,
-            supports_bulk_spi=True if is_x4m200 else None,
-            supports_frame_injection=True if is_x4m200 else None,
+            probe_failures=tuple(failures),
         )
 
     def __getattr__(self, name: str):

@@ -23,12 +23,28 @@ def _ignore(_value: object) -> None:
     pass
 
 
+def _noop(*_args: object, **_kwargs: object) -> None:
+    pass
+
+
+def _return_one(*_args: object, **_kwargs: object) -> int:
+    return 1
+
+
+def _read_file_identifier(**_kwargs: object) -> FileIdentifier:
+    return FileIdentifier(1, 2)
+
+
 def _timeout_read(**_kwargs: object) -> object:
     raise TimeoutError
 
 
 def _subscribe(*_args: object) -> SimpleNamespace:
     return SimpleNamespace(read=_timeout_read)
+
+
+def _value_subscribe(*_args: object) -> SimpleNamespace:
+    return SimpleNamespace(read=_read_file_identifier)
 
 
 class FakeDevice:
@@ -44,9 +60,38 @@ class FakeDevice:
             x4driver_get_fps=lambda: 17.0,
             x4driver_get_iterations=lambda: 16,
             x4driver_get_frame_area=lambda: (0.0, 5.0),
+            x4driver_set_fps=_ignore,
+            x4driver_set_iterations=_ignore,
+        )
+        self.outputs = SimpleNamespace(
+            get_output_control=_return_one,
+            set_output_control=_noop,
+        )
+        self.noisemap = SimpleNamespace(
+            load_noisemap=lambda: None,
+            get_noisemap_control=lambda: 1,
+            set_noisemap_control=_ignore,
+            store_noisemap=lambda: None,
+            delete_noisemap=lambda: None,
+        )
+        self.gpio = SimpleNamespace(
+            get_iopin_control=lambda _pin: (1, 2),  # pyright: ignore[reportUnknownLambdaType]
+            get_iopin_value=_return_one,
+            set_iopin_control=_noop,
+            set_iopin_value=_noop,
+        )
+        self.unsafe = SimpleNamespace(
+            reset_to_factory_preset=_noop,
+            filesystem_admin=SimpleNamespace(format_filesystem=_noop),
         )
         self.filesystem = SimpleNamespace(find_all_files=lambda: [FileIdentifier(1, 2)])
-        self.messages = SimpleNamespace(all=SimpleNamespace(subscribe=_subscribe))
+        topic = SimpleNamespace(subscribe=_value_subscribe)
+        self.messages = SimpleNamespace(
+            all=SimpleNamespace(subscribe=_subscribe),
+            sleep=topic,
+            respiration=topic,
+            vital_signs=topic,
+        )
         self.detected_baudrate = 115200
 
     def configure(self, _config: object) -> None:
@@ -140,6 +185,23 @@ def test_cli_info_capabilities_and_configured_actions(
         ["get", "profile-id", "--port", "fake"],
         ["get", "sensor-mode", "--port", "fake"],
         ["files", "list", "--port", "fake"],
+        ["set", "xep.fps", "10", "--port", "fake"],
+        ["set", "xep.iterations", "8", "--port", "fake"],
+        ["set", "profile-id", "1", "--port", "fake"],
+        ["outputs", "get", "0xc", "--port", "fake"],
+        ["outputs", "set", "0xc", "1", "--port", "fake"],
+        ["messages", "sleep", "--count", "1", "--port", "fake"],
+        ["noisemap", "load", "--port", "fake"],
+        ["noisemap", "get-control", "--port", "fake"],
+        ["noisemap", "set-control", "1", "--port", "fake"],
+        ["gpio", "get-control", "1", "--port", "fake"],
+        ["gpio", "get-value", "1", "--port", "fake"],
+        ["gpio", "set-control", "1", "1", "2", "--port", "fake"],
+        ["gpio", "set-value", "1", "1", "--port", "fake"],
+        ["unsafe", "store-noisemap", "--port", "fake"],
+        ["unsafe", "delete-noisemap", "--port", "fake"],
+        ["unsafe", "factory-reset", "--confirm", "--port", "fake"],
+        ["unsafe", "format-filesystem", "--key", "1", "--port", "fake"],
     ):
         assert cli.main(args) == 0
     output = capsys.readouterr().out

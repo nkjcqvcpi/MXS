@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "MXS"
-version = "0.2.0"
+version = "0.2.1"
 description = "A Modern Unofficial XeThru X4M200 SDK"
 readme = "README.md"
 requires-python = ">=3.14"
@@ -31,7 +31,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/mxs", "src/x4cir"]
+packages = ["src/mxs"]
 
 [tool.hatch.build]
 exclude = [
@@ -43,7 +43,7 @@ exclude = [
 ]
 
 [tool.pytest.ini_options]
-addopts = "--strict-config --strict-markers --cov=mxs --cov-report=term-missing --cov-fail-under=90"
+addopts = "--strict-config --strict-markers --cov=mxs --cov-report=term-missing --cov-fail-under=92"
 testpaths = ["tests"]
 markers = [
   "hardware: requires a connected X4M200",
