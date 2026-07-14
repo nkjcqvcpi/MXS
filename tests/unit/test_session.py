@@ -2,10 +2,10 @@ import threading
 
 import pytest
 
+from mxs import X4M200, X4Config
+from mxs.constants import DeviceState
+from mxs.errors import CommandRejectedError, DeviceDisconnectedError, InvalidDeviceStateError
 from tests.conftest import FakeSerialFactory
-from x4cir import X4M200, X4Config
-from x4cir.constants import DeviceState
-from x4cir.errors import CommandRejectedError, DeviceDisconnectedError, InvalidDeviceStateError
 
 
 def test_fake_serial_full_lifecycle_and_partial_io() -> None:
@@ -20,7 +20,18 @@ def test_fake_serial_full_lifecycle_and_partial_io() -> None:
     radar.stop()
     radar.close()
     radar.close()
-    assert not any(thread.name.startswith("x4cir-fake") for thread in threading.enumerate())
+    assert not any(thread.name.startswith("mxs-fake") for thread in threading.enumerate())
+
+
+def test_reopen_same_object_builds_fresh_workers_and_subscriptions() -> None:
+    factory = FakeSerialFactory()
+    radar = X4M200(port="fake", serial_factory=factory)
+    radar.open()
+    first_messages = radar.messages
+    radar.close()
+    radar.open()
+    assert radar.messages is not first_messages
+    radar.close()
 
 
 def test_invalid_state_transitions() -> None:

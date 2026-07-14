@@ -2,8 +2,8 @@ import threading
 import time
 from collections import deque
 
-from x4cir.commands import build_ping, build_set_fps
-from x4cir.framing import encode_classic_frame
+from mxs.commands import build_ping, build_set_fps
+from mxs.framing import encode_classic_frame
 
 SLEEP_FRAME = bytes.fromhex(
     "7d506ca1752350050000040000000000000000000000000000000000000000000000e77e"

@@ -25,7 +25,8 @@ from .commands import (
 from .constants import DeviceState, SensorMode
 from .diagnostics import StatisticsTracker
 from .errors import BaudDetectionError, InvalidDeviceStateError, WorkerTerminatedError
-from .models import Ack, CirFrame, SessionStatistics, X4Config
+from .expectations import ResponseExpectation
+from .models import Ack, CirFrame, Pong, Reply, SessionStatistics, X4Config
 from .router import CommandManager, FrameSubscription, MessageRouter, QueuePolicy
 from .transport import SerialFactory, SerialWorker
 
@@ -55,7 +56,28 @@ class DeviceSession:
         self.state = DeviceState.CLOSED
         self.config: X4Config | None = None
         self.statistics_tracker = StatisticsTracker()
-        self.command_manager = CommandManager(self.statistics_tracker, lambda: self.state.name)
+        self._frame_queue_size: int = frame_queue_size
+        self._overflow_policy: QueuePolicy = overflow_policy
+        self._opened_once = False
+        self.command_manager: CommandManager
+        self.router: MessageRouter
+        self.frames: FrameSubscription
+        self._build_runtime()
+        self.worker: SerialWorker | None = None
+
+    @property
+    def frame_queue_size(self) -> int:
+        return self._frame_queue_size
+
+    @property
+    def overflow_policy(self) -> QueuePolicy:
+        return self._overflow_policy
+
+    def _build_runtime(self) -> None:
+        """Build all per-open objects so a closed device can be reopened safely."""
+        self.command_manager = CommandManager(
+            self.statistics_tracker, lambda: self.state.name, self._desynchronize
+        )
         self.router = MessageRouter(
             self.statistics_tracker,
             self.command_manager,
@@ -63,11 +85,12 @@ class DeviceSession:
             lambda: self.config.downconversion if self.config else False,
         )
         self.router.fatal_callback = self._fatal_error
-        self.frames: FrameSubscription = self.router.subscribe(frame_queue_size, overflow_policy)
-        self.worker: SerialWorker | None = None
+        self.frames = self.router.subscribe(self._frame_queue_size, self._overflow_policy)
 
     def open(self) -> None:
         self._require(DeviceState.CLOSED)
+        if self._opened_once:
+            self._build_runtime()
         candidates = (
             (115200, 921600)
             if self.requested_baudrate == "auto"
@@ -100,6 +123,7 @@ class DeviceSession:
                     )
                 self.detected_baudrate = baudrate
                 self._transition(DeviceState.OPEN)
+                self._opened_once = True
                 LOGGER.info("detected %d baud", baudrate)
                 return
             except BaseException as error:
@@ -197,6 +221,7 @@ class DeviceSession:
                 self._best_effort("STOP", build_set_sensor_mode(SensorMode.STOP))
             self.worker.close()
         self.router.close()
+        self.worker = None
         self._transition(DeviceState.CLOSED)
 
     def close_passive(self) -> None:
@@ -207,7 +232,22 @@ class DeviceSession:
         if self.worker is not None:
             self.worker.close()
         self.router.close()
+        self.worker = None
         self._transition(DeviceState.CLOSED)
+
+    def recover(self) -> None:
+        """Discard a desynchronized transport and reopen in a known STOP state."""
+        if self.state is not DeviceState.DESYNCHRONIZED:
+            raise InvalidDeviceStateError("recover() is only valid after an ACK timeout")
+        if self.worker is not None:
+            with suppress(BaseException):
+                self.worker.close()
+        self.router.close()
+        self.worker = None
+        self._transition(DeviceState.CLOSED)
+        self.open()
+        self._command("RECOVER STOP", build_set_sensor_mode(SensorMode.STOP))
+        self._transition(DeviceState.STOPPED)
 
     def statistics(self) -> SessionStatistics:
         return self.statistics_tracker.snapshot()
@@ -221,6 +261,19 @@ class DeviceSession:
         if not isinstance(response, Ack):  # pragma: no cover - type invariant
             raise WorkerTerminatedError(f"{name} did not receive ACK")
         return response
+
+    def execute(
+        self, name: str, packet: bytes, expectation: ResponseExpectation
+    ) -> Ack | Reply | Pong:
+        if self.worker is None or not self.worker.alive:
+            raise WorkerTerminatedError("serial worker is not running")
+        return self.command_manager.execute(
+            name,
+            packet,
+            self.worker.send,
+            self.command_timeout,
+            expectation=expectation,
+        )
 
     def _best_effort(self, name: str, packet: bytes) -> None:
         try:
@@ -252,3 +305,11 @@ class DeviceSession:
         if self.state not in (DeviceState.CLOSING, DeviceState.CLOSED):
             LOGGER.error("device session failed: %s", error)
             self._transition(DeviceState.ERROR)
+
+    def _desynchronize(self, error: BaseException) -> None:
+        LOGGER.error("command timeout desynchronized device session: %s", error)
+        if self.state not in (DeviceState.CLOSING, DeviceState.CLOSED):
+            self._transition(DeviceState.DESYNCHRONIZED)
+        if self.worker is not None and self.worker.alive:
+            with suppress(BaseException):
+                self.worker.close()

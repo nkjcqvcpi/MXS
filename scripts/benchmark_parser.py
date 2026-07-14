@@ -2,8 +2,8 @@ import argparse
 import time
 from pathlib import Path
 
-from x4cir.framing import McpStreamDecoder
-from x4cir.recording import replay_wire
+from mxs.framing import McpStreamDecoder
+from mxs.recording import replay_wire
 
 parser = argparse.ArgumentParser()
 parser.add_argument("path", type=Path)

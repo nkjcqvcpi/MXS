@@ -3,16 +3,17 @@ import struct
 import numpy as np
 import pytest
 
-from x4cir.constants import CONTENT_ID_BASEBAND_IQ, CONTENT_ID_RAW_FRAME
-from x4cir.errors import InvalidIqFrameError, MalformedMessageError
-from x4cir.messages import data_float_to_iq, decode_message
-from x4cir.models import (
+from mxs.constants import CONTENT_ID_BASEBAND_IQ, CONTENT_ID_RAW_FRAME
+from mxs.errors import InvalidIqFrameError, MalformedMessageError
+from mxs.messages import data_float_to_iq, decode_message
+from mxs.models import (
     Ack,
     BasebandIqMessage,
     DataFloatMessage,
     ErrorResponse,
+    FloatReply,
+    IntReply,
     Pong,
-    Reply,
     UnknownMessage,
 )
 
@@ -64,18 +65,29 @@ def test_baseband_iq_appdata() -> None:
 
 def test_reply_short_long_and_unknown_datatype() -> None:
     short = b"\x11\x12" + struct.pack("<II", 3, 4) + b"\x04"
-    assert decode_message(short) == Reply(0x12, 3, 4, b"", 4)
-    long = b"\x11\x99" + struct.pack("<III", 3, 4, 3) + b"abc\x01"
-    assert decode_message(long) == Reply(0x99, 3, 4, b"abc", 1)
+    decoded = decode_message(short)
+    assert isinstance(decoded, FloatReply)
+    assert decoded.element_count == 0
+    long = b"\x11\x12" + struct.pack("<III", 3, 4, 2) + struct.pack("<ff", 1, 2) + b"\x04"
+    decoded = decode_message(long)
+    assert isinstance(decoded, FloatReply)
+    np.testing.assert_array_equal(decoded.values, [1, 2])
+    integer_without_size = b"\x11\x11" + struct.pack("<IIIi", 7, 0, 1, 42)
+    integer = decode_message(integer_without_size)
+    assert isinstance(integer, IntReply)
+    assert integer.values.tolist() == [42]
     with pytest.raises(MalformedMessageError):
         decode_message(long[:-1])
+    with pytest.raises(MalformedMessageError):
+        decode_message(b"\x11\x99" + struct.pack("<II", 3, 4))
 
 
 def test_zero_data_unknown_data_and_unknown_appdata() -> None:
     zero = decode_message(b"\xa0\x12" + struct.pack("<II", 0, 1))
     assert isinstance(zero, DataFloatMessage)
     assert zero.samples.size == 0
-    assert isinstance(decode_message(b"\xa0\x10"), UnknownMessage)
+    with pytest.raises(MalformedMessageError):
+        decode_message(b"\xa0\x10")
     assert isinstance(decode_message(b"\x50" + struct.pack("<I", 99)), UnknownMessage)
 
 

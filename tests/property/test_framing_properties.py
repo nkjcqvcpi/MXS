@@ -1,7 +1,7 @@
 from hypothesis import given
 from hypothesis import strategies as st
 
-from x4cir.framing import McpStreamDecoder, encode_classic_frame
+from mxs.framing import McpStreamDecoder, encode_classic_frame
 
 
 @given(st.binary(max_size=4096), st.lists(st.integers(min_value=1, max_value=64), max_size=40))

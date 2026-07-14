@@ -1,18 +1,21 @@
 """Command-line interface for discovery, diagnostics, capture, and recording."""
 
 import argparse
+import json
 import logging
 import signal
 import sys
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
 
+from .constants import SensorMode, SystemInfoCode
 from .device import X4M200
 from .discovery import list_serial_ports
 from .models import CirFrame, X4Config
-from .recording import WireRecorder, save_npz
+from .recording import ParsedMessageRecorder, WireRecorder, replay_parsed, replay_wire, save_npz
 from .session import DeviceSession
 
 
@@ -26,17 +29,38 @@ def _baud(value: str) -> str | int:
 
 
 def _base_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="x4cir")
+    parser = argparse.ArgumentParser(prog="mxs")
     parser.add_argument("--debug", action="store_true")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("ports")
-    for name in ("sniff", "probe"):
+    for name in ("sniff", "probe", "info", "capabilities", "doctor"):
         child = sub.add_parser(name)
         child.add_argument("--port", default="/dev/tty.usbmodem2101")
         child.add_argument("--baud", type=_baud, default="auto")
         if name == "sniff":
             child.add_argument("--seconds", type=float, default=5.0)
             child.add_argument("--hex", action="store_true", dest="show_hex")
+    replay = sub.add_parser("replay-wire")
+    replay.add_argument("path", type=Path)
+    benchmark = sub.add_parser("benchmark")
+    benchmark.add_argument("path", type=Path)
+    benchmark.add_argument("--iterations", type=int, default=100)
+    profile = sub.add_parser("profile")
+    profile.add_argument("action", choices=("load",))
+    profile.add_argument("profile_id", type=lambda value: int(value, 0))
+    _device_options(profile)
+    sensor_mode = sub.add_parser("sensor-mode")
+    sensor_mode.add_argument("mode", choices=("run", "idle", "manual", "stop"))
+    _device_options(sensor_mode)
+    getter = sub.add_parser("get")
+    getter.add_argument(
+        "setting",
+        choices=("xep.fps", "xep.iterations", "xep.frame-area", "profile-id", "sensor-mode"),
+    )
+    _device_options(getter)
+    files = sub.add_parser("files")
+    files.add_argument("action", choices=("list",))
+    _device_options(files)
     capture = sub.add_parser("capture")
     _capture_options(capture)
     stream = sub.add_parser("stream")
@@ -47,7 +71,18 @@ def _base_parser() -> argparse.ArgumentParser:
     wire.add_argument("--baud", type=_baud, default="auto")
     wire.add_argument("--duration", type=float, required=True)
     wire.add_argument("--output", type=Path, required=True)
+    messages = sub.add_parser("record-messages")
+    _device_options(messages)
+    messages.add_argument("--duration", type=float, required=True)
+    messages.add_argument("--output", type=Path, required=True)
+    replay_messages = sub.add_parser("replay-messages")
+    replay_messages.add_argument("path", type=Path)
     return parser
+
+
+def _device_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--port", default="/dev/tty.usbmodem2101")
+    parser.add_argument("--baud", type=_baud, default="auto")
 
 
 def _capture_options(
@@ -144,6 +179,84 @@ def _record_wire(args: argparse.Namespace) -> int:
     return 0
 
 
+def _record_messages(args: argparse.Namespace) -> int:
+    with (
+        ParsedMessageRecorder(args.output) as recorder,
+        X4M200(port=args.port, baudrate=args.baud) as device,
+    ):
+        subscription = device.messages.all.subscribe(512, "error")
+        deadline = time.monotonic() + args.duration
+        count = 0
+        while time.monotonic() < deadline:
+            try:
+                timeout = max(0.0, min(0.25, deadline - time.monotonic()))
+                recorder.append(subscription.read(timeout=timeout))
+                count += 1
+            except TimeoutError:
+                continue
+    print(f"recorded {count} parsed messages to {args.output}")
+    return 0
+
+
+def _info(args: argparse.Namespace, capabilities: bool = False) -> int:
+    with X4M200(port=args.port, baudrate=args.baud) as device:
+        if capabilities:
+            print(json.dumps(asdict(device.probe_capabilities()), sort_keys=True))
+        else:
+            for code in SystemInfoCode:
+                try:
+                    print(f"{code.name.lower()}: {device.module.get_system_info(code)}")
+                except Exception as error:
+                    print(f"{code.name.lower()}: unsupported ({error})")
+    return 0
+
+
+def _benchmark(args: argparse.Namespace) -> int:
+    from .framing import McpStreamDecoder
+
+    chunks = list(replay_wire(args.path))
+    byte_count = sum(map(len, chunks)) * args.iterations
+    started = time.perf_counter()
+    for _ in range(args.iterations):
+        decoder = McpStreamDecoder()
+        for chunk in chunks:
+            decoder.feed(chunk)
+    elapsed = time.perf_counter() - started
+    print(
+        json.dumps(
+            {"bytes": byte_count, "seconds": elapsed, "bytes_per_second": byte_count / elapsed}
+        )
+    )
+    return 0
+
+
+def _configured_action(args: argparse.Namespace) -> int:
+    with X4M200(port=args.port, baudrate=args.baud) as device:
+        if args.command == "profile":
+            device.profile.load_profile(args.profile_id)
+        elif args.command == "sensor-mode":
+            mode = {
+                "run": SensorMode.RUN,
+                "idle": SensorMode.IDLE,
+                "manual": SensorMode.MANUAL,
+                "stop": SensorMode.STOP,
+            }[args.mode]
+            device.profile.set_sensor_mode(mode)
+        elif args.command == "files":
+            for item in device.filesystem.find_all_files():
+                print(f"0x{item.file_type:08x}\t0x{item.identifier:08x}")
+        else:
+            getters = {
+                "xep.fps": device.xep.x4driver_get_fps,
+                "xep.iterations": device.xep.x4driver_get_iterations,
+                "xep.frame-area": device.xep.x4driver_get_frame_area,
+                "profile-id": device.profile.get_profileid,
+                "sensor-mode": device.profile.get_sensor_mode,
+            }
+            print(getters[args.setting]())
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _base_parser()
     args = parser.parse_args(argv)
@@ -161,12 +274,33 @@ def main(argv: list[str] | None = None) -> int:
             return _passive(args, True)
         if args.command == "probe":
             return _passive(args, False)
+        if args.command == "info":
+            return _info(args)
+        if args.command == "capabilities":
+            return _info(args, True)
+        if args.command == "doctor":
+            return _passive(args, False)
         if args.command == "capture":
             return _capture(args)
         if args.command == "stream":
             return _stream(args)
         if args.command == "record-wire":
             return _record_wire(args)
+        if args.command == "record-messages":
+            return _record_messages(args)
+        if args.command == "replay-messages":
+            for record in replay_parsed(args.path, recover_truncated=True):
+                summary = {key: value for key, value in record.items() if key != "fields"}
+                print(json.dumps(summary, sort_keys=True))
+            return 0
+        if args.command == "replay-wire":
+            chunks = list(replay_wire(args.path, recover_truncated=True))
+            print(json.dumps({"chunks": len(chunks), "bytes": sum(map(len, chunks))}))
+            return 0
+        if args.command == "benchmark":
+            return _benchmark(args)
+        if args.command in ("profile", "sensor-mode", "get", "files"):
+            return _configured_action(args)
         parser.error("unknown command")
     except KeyboardInterrupt:
         return 130

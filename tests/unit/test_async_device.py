@@ -2,8 +2,8 @@ import asyncio
 
 import pytest
 
+from mxs import AsyncX4M200, X4Config
 from tests.conftest import FakeSerialFactory
-from x4cir import AsyncX4M200, X4Config
 
 
 @pytest.mark.asyncio
@@ -33,5 +33,20 @@ async def test_cancelled_reader_does_not_close_session() -> None:
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+    assert (await radar.statistics()).frames_received == 1
+    await radar.close()
+
+
+@pytest.mark.asyncio
+async def test_async_timeout_stop_and_frame_iterator() -> None:
+    radar = AsyncX4M200(port="fake", serial_factory=FakeSerialFactory(data_before_ack=False))
+    await radar.open()
+    await radar.configure(X4Config())
+    await radar.start()
+    frame = await anext(radar.frames())
+    assert frame.frame_counter == 42
+    with pytest.raises(TimeoutError):
+        await radar.read_frame(timeout=0.001)
+    await radar.stop()
     assert (await radar.statistics()).frames_received == 1
     await radar.close()

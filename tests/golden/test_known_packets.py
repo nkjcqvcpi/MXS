@@ -1,9 +1,9 @@
 from pathlib import Path
 
-from x4cir.framing import McpStreamDecoder
-from x4cir.messages import decode_message
-from x4cir.models import DataFloatMessage, SleepStatus
-from x4cir.recording import replay_wire
+from mxs.framing import McpStreamDecoder
+from mxs.messages import decode_message
+from mxs.models import DataFloatMessage, SleepStatus
+from mxs.recording import replay_wire
 
 
 def test_sleep_status_hardware_fixture() -> None:

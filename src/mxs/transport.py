@@ -9,6 +9,7 @@ from typing import Protocol, cast
 
 import serial
 
+from .constants import ResponseType
 from .diagnostics import StatisticsTracker
 from .errors import (
     DeviceDisconnectedError,
@@ -50,6 +51,125 @@ Request = WriteRequest | BaudRequest
 SerialFactory = Callable[[str, int], SerialLike]
 
 
+class DecoderWorker:
+    """Prioritized control decoding and ordered stream decoding off the serial thread."""
+
+    def __init__(
+        self,
+        router: MessageRouter,
+        statistics: StatisticsTracker,
+        *,
+        control_capacity: int = 64,
+        stream_capacity: int = 512,
+    ) -> None:
+        self.router = router
+        self.statistics = statistics
+        self.control: queue.Queue[bytes] = queue.Queue(control_capacity)
+        self.stream: queue.Queue[bytes] = queue.Queue(stream_capacity)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="mxs-decoder", daemon=False)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def submit(self, payload: bytes) -> None:
+        control_types = {
+            ResponseType.ACK,
+            ResponseType.ERROR,
+            ResponseType.REPLY,
+            ResponseType.PONG,
+            ResponseType.SYSTEM,
+        }
+        target = self.control if payload and payload[0] in control_types else self.stream
+        try:
+            target.put_nowait(payload)
+            self.statistics.maximum(
+                "decoder_control_high_water_mark"
+                if target is self.control
+                else "decoder_stream_high_water_mark",
+                max(1, target.qsize()),
+            )
+        except queue.Full as error:
+            raise FrameBackpressureError(
+                "control decoder queue overflow"
+                if target is self.control
+                else "stream decoder queue overflow"
+            ) from error
+
+    def close(self, timeout: float = 3.0) -> None:
+        self._stop.set()
+        self._thread.join(timeout)
+        if self._thread.is_alive():
+            raise WorkerTerminatedError("message decoder failed to terminate")
+
+    def _run(self) -> None:
+        try:
+            while not self._stop.is_set() or not self.control.empty() or not self.stream.empty():
+                payload: bytes | None = None
+                try:
+                    payload = self.control.get_nowait()
+                except queue.Empty:
+                    try:
+                        payload = self.stream.get(timeout=0.02)
+                    except queue.Empty:
+                        continue
+                try:
+                    self.router.route(decode_message(payload), payload)
+                except FrameBackpressureError:
+                    raise
+                except BaseException as error:
+                    self.statistics.add("malformed_packets")
+                    LOGGER.debug("malformed MCP payload: %s", error)
+        except BaseException as error:
+            self.router.fail(error)
+
+
+class RawCallbackWorker:
+    """Compatibility adapter that isolates a raw recording callback from serial I/O."""
+
+    def __init__(
+        self,
+        callback: Callable[[bytes], None],
+        statistics: StatisticsTracker,
+        capacity: int = 256,
+    ) -> None:
+        self.callback = callback
+        self.statistics = statistics
+        self.queue: queue.Queue[bytes] = queue.Queue(capacity)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="mxs-raw-writer", daemon=False)
+        self.error: BaseException | None = None
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def submit(self, chunk: bytes) -> None:
+        try:
+            self.queue.put_nowait(chunk)
+            self.statistics.maximum("raw_callback_high_water_mark", max(1, self.queue.qsize()))
+        except queue.Full as error:
+            raise FrameBackpressureError("raw recording queue overflow") from error
+
+    def close(self, timeout: float = 3.0) -> None:
+        self._stop.set()
+        self._thread.join(timeout)
+        if self._thread.is_alive():
+            raise WorkerTerminatedError("raw recording worker failed to terminate")
+        if self.error is not None:
+            raise self.error
+
+    def _run(self) -> None:
+        try:
+            while not self._stop.is_set() or not self.queue.empty():
+                try:
+                    chunk = self.queue.get(timeout=0.02)
+                except queue.Empty:
+                    continue
+                self.callback(chunk)
+        except BaseException as error:
+            self.error = error
+
+
 class SerialWorker:
     def __init__(
         self,
@@ -69,10 +189,16 @@ class SerialWorker:
         self.serial_factory = serial_factory
         self.raw_chunk_callback = raw_chunk_callback
         self.decoder = McpStreamDecoder()
+        self.decoder_worker = DecoderWorker(router, statistics)
+        self.raw_worker = (
+            RawCallbackWorker(raw_chunk_callback, statistics)
+            if raw_chunk_callback is not None
+            else None
+        )
         self._requests: queue.Queue[Request] = queue.Queue(tx_capacity)
         self._stop = threading.Event()
         self._opened = threading.Event()
-        self._thread = threading.Thread(target=self._run, name=f"x4cir-{port}", daemon=False)
+        self._thread = threading.Thread(target=self._run, name=f"mxs-{port}", daemon=False)
         self._open_error: BaseException | None = None
         self._fatal_error: BaseException | None = None
 
@@ -81,6 +207,9 @@ class SerialWorker:
         return self._thread.is_alive()
 
     def start(self, timeout: float = 3.0) -> None:
+        self.decoder_worker.start()
+        if self.raw_worker is not None:
+            self.raw_worker.start()
         self._thread.start()
         if not self._opened.wait(timeout):
             raise SerialOpenError(f"serial worker did not open {self.port}")
@@ -111,6 +240,9 @@ class SerialWorker:
         self._thread.join(timeout)
         if self._thread.is_alive():
             raise WorkerTerminatedError("serial worker failed to terminate")
+        self.decoder_worker.close(timeout)
+        if self.raw_worker is not None:
+            self.raw_worker.close(timeout)
 
     def _open_serial(self) -> SerialLike:
         if self.serial_factory is not None:
@@ -165,19 +297,15 @@ class SerialWorker:
                     chunk = bytes(memoryview(read_buffer)[:received])
                     self.statistics.add("bytes_received", received)
                     if self.raw_chunk_callback is not None:
-                        self.raw_chunk_callback(chunk)
+                        if self.raw_worker is None:  # pragma: no cover - constructor invariant
+                            raise RuntimeError("raw callback worker is unavailable")
+                        self.raw_worker.submit(chunk)
                     before_classic = self.decoder.statistics.classic_packets
                     before_noescape = self.decoder.statistics.noescape_packets
                     before_crc = self.decoder.statistics.crc_errors
                     before_malformed = self.decoder.statistics.malformed_packets
                     for payload in self.decoder.feed(chunk):
-                        try:
-                            self.router.route(decode_message(payload), payload)
-                        except FrameBackpressureError:
-                            raise
-                        except BaseException as error:
-                            self.statistics.add("malformed_packets")
-                            LOGGER.debug("malformed MCP payload: %s", error)
+                        self.decoder_worker.submit(payload)
                     self.statistics.add(
                         "classic_packets", self.decoder.statistics.classic_packets - before_classic
                     )

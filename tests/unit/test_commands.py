@@ -1,6 +1,6 @@
 import pytest
 
-from x4cir.commands import (
+from mxs.commands import (
     build_ping,
     build_set_baudrate,
     build_set_dac_max,
@@ -18,7 +18,7 @@ from x4cir.commands import (
     build_set_tx_power,
     build_x4_init,
 )
-from x4cir.constants import SensorMode
+from mxs.constants import SensorMode
 
 # Independently transcribed vectors generated from the local C field order and
 # XOR/escaping rules, without calling the Python encoder under test.

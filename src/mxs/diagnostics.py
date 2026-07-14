@@ -25,6 +25,9 @@ class StatisticsTracker:
             "consumer_drops": 0,
             "queue_overflows": 0,
             "queue_high_water_mark": 0,
+            "decoder_control_high_water_mark": 0,
+            "decoder_stream_high_water_mark": 0,
+            "raw_callback_high_water_mark": 0,
             "maximum_command_latency_seconds": 0.0,
         }
 
@@ -57,5 +60,8 @@ class StatisticsTracker:
                 consumer_drops=int(v["consumer_drops"]),
                 queue_overflows=int(v["queue_overflows"]),
                 queue_high_water_mark=int(v["queue_high_water_mark"]),
+                decoder_control_high_water_mark=int(v["decoder_control_high_water_mark"]),
+                decoder_stream_high_water_mark=int(v["decoder_stream_high_water_mark"]),
+                raw_callback_high_water_mark=int(v["raw_callback_high_water_mark"]),
                 maximum_command_latency_seconds=float(v["maximum_command_latency_seconds"]),
             )

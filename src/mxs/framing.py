@@ -1,5 +1,6 @@
 """Classic and no-escape MCP framing."""
 
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum, auto
 
@@ -60,7 +61,7 @@ class McpStreamDecoder:
         self.max_packet_size = max_packet_size
         self.state = DecoderState.SEARCHING
         self.statistics = DecoderStatistics()
-        self.errors: list[ProtocolError] = []
+        self.errors: deque[ProtocolError] = deque(maxlen=32)
         self._classic = bytearray()
         self._marker_count = 0
         self._noesc_length = bytearray()

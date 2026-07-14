@@ -3,8 +3,12 @@
 from dataclasses import dataclass
 
 
-class X4CirError(Exception):
+class MxsError(Exception):
     """Base exception for the package."""
+
+
+# 0.1 name retained for source compatibility.
+X4CirError = MxsError
 
 
 class SerialOpenError(X4CirError):
@@ -73,4 +77,32 @@ class FrameBackpressureError(X4CirError):
 
 
 class WorkerTerminatedError(X4CirError):
+    pass
+
+
+class UnsafeOperationDisabledError(MxsError):
+    pass
+
+
+class UnsupportedFirmwareError(MxsError):
+    pass
+
+
+class SessionDesynchronizedError(MxsError):
+    pass
+
+
+class AmbiguousDeviceError(MxsError):
+    pass
+
+
+class MessageQueueOverflowError(MxsError):
+    pass
+
+
+class RecordingBackpressureError(MxsError):
+    pass
+
+
+class ReplyMismatchError(ProtocolError):
     pass

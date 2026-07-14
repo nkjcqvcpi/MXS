@@ -1,6 +1,6 @@
 import asyncio
 
-from x4cir import AsyncX4M200, X4Config
+from mxs import AsyncX4M200, X4Config
 
 
 async def main() -> None:

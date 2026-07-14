@@ -4,10 +4,17 @@ import time
 import numpy as np
 import pytest
 
-from x4cir.diagnostics import StatisticsTracker
-from x4cir.errors import CommandRejectedError, FrameBackpressureError
-from x4cir.models import Ack, DataFloatMessage, ErrorResponse
-from x4cir.router import CommandManager, MessageRouter
+from mxs.diagnostics import StatisticsTracker
+from mxs.errors import (
+    CommandRejectedError,
+    CommandTimeoutError,
+    FrameBackpressureError,
+    ReplyMismatchError,
+    SessionDesynchronizedError,
+)
+from mxs.expectations import reply
+from mxs.models import Ack, DataFloatMessage, ErrorResponse, IntReply
+from mxs.router import CommandManager, MessageRouter
 
 
 def make_router(downconversion: bool = False) -> tuple[MessageRouter, StatisticsTracker]:
@@ -93,3 +100,39 @@ def test_commands_are_serialized_and_firmware_error_is_preserved() -> None:
         manager.execute("REJECT", b"packet", reject)
     assert caught.value.firmware_error_code == 0x21
     assert caught.value.device_state == "MANUAL"
+
+
+def test_command_expectations_timeout_and_reset() -> None:
+    statistics = StatisticsTracker()
+    desynchronized: list[BaseException] = []
+    manager = CommandManager(statistics, lambda: "OPEN", desynchronized.append)
+
+    def no_response(_packet: bytes, _timeout: float) -> None:
+        pass
+
+    with pytest.raises(CommandTimeoutError):
+        manager.execute("TIMEOUT", b"x", no_response, timeout=0.001)
+    assert desynchronized
+    with pytest.raises(SessionDesynchronizedError):
+        manager.execute("LATE", b"x", no_response)
+    manager.reset()
+
+    def mismatch(_packet: bytes, _timeout: float) -> None:
+        manager.route(IntReply(2, 0, 1, 4, np.asarray([1], np.int32)), b"reply")
+
+    with pytest.raises(ReplyMismatchError):
+        manager.execute("GET", b"x", mismatch, expectation=reply(IntReply, 1, element_count=1))
+
+
+def test_remaining_frame_queue_policies_and_router_close() -> None:
+    router, _ = make_router()
+    newest = router.subscribe(1, "drop_newest")
+    router.route(message(1), b"")
+    router.route(message(2), b"")
+    first = newest.queue.get_nowait()
+    assert not isinstance(first, BaseException) and first.frame_counter == 1
+    router.subscribe(1, "block_with_timeout")
+    router.route(message(3), b"")
+    with pytest.raises(FrameBackpressureError):
+        router.route(message(4), b"")
+    router.close()

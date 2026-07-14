@@ -18,13 +18,19 @@ host parser labels it unused and performs no integrity check. This
 implementation skips that field and validates the packet boundary and inner
 message lengths.
 
-## Reply short form
+## Reply element counts and producer inconsistency
 
-`protocol_host_parser.c:parse_reply` permits a short reply containing response
-type, data type, content ID, info, and one trailing data-size byte. Longer
-replies add a 32-bit byte length, data bytes, and a final data-size byte. The C
-parser does not adequately bounds-check the latter form. The Python parser
-supports both forms with strict bounds checks.
+The field after `info` is an element count, not a byte count. The byte length is
+`element_count * element_size`. The target integer producer omits the trailing
+element-size byte, while byte, string, and float producers append it. MXS uses
+the datatype size, accepts the integer variant with or without the trailing
+size, and rejects ambiguous lengths. Empty integer replies may omit count and
+size; other typed empty replies carry their size byte.
+
+Real getter replies from Annapurna 1.6.6 are stored in
+`tests/golden/fixtures/device_getters_0_2.mcpbin`. The observed sensor-mode
+reply uses content ID zero, which takes precedence over the absent callback in
+the checked-in XEP target application.
 
 ## Baseband APPDATA structure sizing
 
@@ -45,4 +51,3 @@ checksum.
 
 The MCP wrapper is MIT licensed. This project expresses the wire protocol
 independently and includes the upstream copyright and license in `NOTICE.md`.
-

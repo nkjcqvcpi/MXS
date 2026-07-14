@@ -1,7 +1,7 @@
 import pytest
 
-from x4cir.constants import ESCAPE_BYTE, START_BYTE, STOP_BYTE
-from x4cir.framing import DecoderState, McpStreamDecoder, encode_classic_frame
+from mxs.constants import ESCAPE_BYTE, START_BYTE, STOP_BYTE
+from mxs.framing import DecoderState, McpStreamDecoder, encode_classic_frame
 
 
 @pytest.mark.parametrize("payload", [b"", b"abc", bytes([START_BYTE, STOP_BYTE, ESCAPE_BYTE])])

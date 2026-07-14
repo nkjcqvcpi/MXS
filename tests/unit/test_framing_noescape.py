@@ -1,7 +1,7 @@
 import struct
 
-from x4cir.constants import NO_ESCAPE_MARKER
-from x4cir.framing import McpStreamDecoder, encode_classic_frame
+from mxs.constants import NO_ESCAPE_MARKER
+from mxs.framing import McpStreamDecoder, encode_classic_frame
 
 
 def noescape(payload: bytes, checksum: int = 0) -> bytes:

@@ -4,19 +4,20 @@ build-backend = "hatchling.build"
 
 [project]
 name = "MXS"
-version = "0.1.0"
+version = "0.2.0"
 description = "A Modern Unofficial XeThru X4M200 SDK"
 readme = "README.md"
 requires-python = ">=3.14"
-license = "GPLv3"
+license = "GPL-3.0-only"
 authors = [{ name = "Nkjcqvcpi" }]
 dependencies = [
   "numpy>=2.4.0",
   "pyserial>=3.5",
+  "scipy>=1.17.0",
 ]
 
 [project.scripts]
-x4cir = "x4cir.cli:main"
+mxs = "mxs.cli:main"
 
 [dependency-groups]
 dev = [
@@ -30,7 +31,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/x4cir"]
+packages = ["src/mxs", "src/x4cir"]
 
 [tool.hatch.build]
 exclude = [
@@ -42,11 +43,12 @@ exclude = [
 ]
 
 [tool.pytest.ini_options]
-addopts = "--strict-config --strict-markers --cov=x4cir --cov-report=term-missing --cov-fail-under=80"
+addopts = "--strict-config --strict-markers --cov=mxs --cov-report=term-missing --cov-fail-under=90"
 testpaths = ["tests"]
 markers = [
   "hardware: requires a connected X4M200",
   "soak: long-running acquisition test",
+  "unsafe: requires a specific unsafe operation gate",
 ]
 timeout = 30
 asyncio_mode = "strict"

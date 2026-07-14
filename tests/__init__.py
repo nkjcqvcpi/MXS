@@ -1,1 +1,1 @@
-"""x4cir test support package."""
+"""mxs test support package."""

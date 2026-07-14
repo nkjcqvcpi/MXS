@@ -2,7 +2,7 @@ import threading
 
 import pytest
 
-from x4cir import X4M200, X4Config
+from mxs import X4M200, X4Config
 
 
 @pytest.mark.hardware
@@ -15,4 +15,4 @@ def test_ten_repeated_lifecycles() -> None:
             for _ in range(20):
                 radar.read_frame(timeout=2.0)
             radar.stop()
-    assert not any(thread.name.startswith("x4cir-") for thread in threading.enumerate())
+    assert not any(thread.name.startswith("mxs-") for thread in threading.enumerate())

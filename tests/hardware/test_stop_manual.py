@@ -1,6 +1,6 @@
 import pytest
 
-from x4cir import X4M200, X4Config
+from mxs import X4M200, X4Config
 
 
 @pytest.mark.hardware

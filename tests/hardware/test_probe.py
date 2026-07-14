@@ -1,6 +1,6 @@
 import pytest
 
-from x4cir.session import DeviceSession
+from mxs.session import DeviceSession
 
 
 @pytest.mark.hardware

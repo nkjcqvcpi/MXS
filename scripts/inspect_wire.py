@@ -1,9 +1,9 @@
 import argparse
 from pathlib import Path
 
-from x4cir.framing import McpStreamDecoder
-from x4cir.messages import decode_message
-from x4cir.recording import replay_wire
+from mxs.framing import McpStreamDecoder
+from mxs.messages import decode_message
+from mxs.recording import replay_wire
 
 parser = argparse.ArgumentParser()
 parser.add_argument("path", type=Path)

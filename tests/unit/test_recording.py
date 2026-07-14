@@ -1,9 +1,21 @@
 from pathlib import Path
+from typing import cast
 
 import numpy as np
+import pytest
+from numpy.typing import NDArray
 
-from x4cir.models import CirFrame, X4Config
-from x4cir.recording import ChunkedCirRecorder, WireRecorder, replay_wire, save_npz
+from mxs.models import CirFrame, DataByteMessage, X4Config
+from mxs.recording import (
+    ChunkedCirRecorder,
+    ParsedMessageRecorder,
+    WireRecorder,
+    replay_parsed,
+    replay_wire,
+    save_npz,
+)
+
+# pyright: reportPrivateUsage=false
 
 
 def frame(counter: int) -> CirFrame:
@@ -13,9 +25,15 @@ def frame(counter: int) -> CirFrame:
 def test_wire_round_trip_and_truncation(tmp_path: Path) -> None:
     path = tmp_path / "test.mcpbin"
     with WireRecorder(path, "fake", 115200) as recorder:
+        assert recorder.bytes_written == 0
+        assert recorder.backlog == 0
+        assert recorder.queue_high_water_mark == 0
         recorder.write_chunk(b"one")
         recorder.write_chunk(b"two")
+        assert recorder.queue_high_water_mark > 0
     assert list(replay_wire(path)) == [b"one", b"two"]
+    assert recorder.bytes_written == 6
+    assert recorder.backlog == 0
     path.write_bytes(path.read_bytes()[:-1])
     try:
         list(replay_wire(path))
@@ -38,3 +56,40 @@ def test_npz_and_chunked_recording(tmp_path: Path) -> None:
         chunks.append(item)
     chunks.close()
     assert len(list((tmp_path / "chunks").glob("chunk-*.npy"))) == 2
+
+
+def test_parsed_message_recording_and_recovery(tmp_path: Path) -> None:
+    directory = tmp_path / "messages"
+    with ParsedMessageRecorder(directory) as recorder:
+        recorder.append(DataByteMessage(1, 2, b"abc"))
+        recorder.append(frame(3))
+    records = list(replay_parsed(directory))
+    assert len(records) == 2
+    assert records[0]["fields"] == {"content_id": 1, "info": 2, "data": b"abc"}
+    values = records[1]["fields"]
+    assert isinstance(values, dict)
+    assert np.array_equal(
+        cast("NDArray[np.float32]", values["samples"]), np.asarray([1, 2], np.float32)
+    )
+    assert recorder.queue_high_water_mark > 0
+    with (directory / "messages.jsonl").open("a") as target:
+        target.write("{")
+    assert len(list(replay_parsed(directory, recover_truncated=True))) == 2
+    with pytest.raises(ValueError):
+        list(replay_parsed(directory))
+
+
+def test_parsed_message_validation(tmp_path: Path) -> None:
+    recorder = ParsedMessageRecorder(tmp_path)
+    assert recorder._encode(np.float32(1.5), 0, "scalar") == 1.5
+    with pytest.raises(TypeError):
+        recorder._encode(object(), 0, "bad")
+    recorder._error = RuntimeError("writer failed")
+    with pytest.raises(RuntimeError, match="writer failed"):
+        recorder.append("message")
+    (tmp_path / "messages.jsonl").write_text("")
+    with pytest.raises(ValueError, match="missing"):
+        list(replay_parsed(tmp_path))
+    (tmp_path / "messages.jsonl").write_text('{"format":"wrong","version":1}\n')
+    with pytest.raises(ValueError, match="unsupported"):
+        list(replay_parsed(tmp_path))

@@ -1,14 +1,9 @@
-"""Pure-Python X4M200 CIR acquisition."""
+"""Compatibility namespace for MXS 0.1 imports.
 
-from .async_device import AsyncX4M200
-from .device import X4M200
-from .errors import *  # noqa: F403
-from .models import CirFrame, SessionStatistics, X4Config
+New code should import :mod:`mxs`.  The compatibility package deliberately
+exports only the 0.1 public surface; protocol internals were never public.
+"""
 
-__all__ = [
-    "X4M200",
-    "AsyncX4M200",
-    "CirFrame",
-    "SessionStatistics",
-    "X4Config",
-]
+from mxs import X4M200, AsyncX4M200, CirFrame, SessionStatistics, X4Config
+
+__all__ = ["X4M200", "AsyncX4M200", "CirFrame", "SessionStatistics", "X4Config"]

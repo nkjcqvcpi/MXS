@@ -17,13 +17,20 @@ below are read-only sources under `./Legacy-SW`.
 | X4 parameter IDs and setters | `MCPWrapper/mcp_wrapper_1.3.1/src/mcp/xtserial_definitions.h`: `serial_protocol_command_x4driver_id_t`; `protocol.c`: `createX4DriverSet*Command` |
 | X4 driver initialization | `MCPWrapper/mcp_wrapper_1.3.1/src/mcp/protocol.c`: `createX4DriverInitCommand` |
 | ACK, ERROR, PONG, and REPLY parsing | `MCPWrapper/mcp_wrapper_1.3.1/src/mcp/protocol_host_parser.c`: `parse_ack`, `parse_error`, `parse_pong`, `parse_reply` |
+| Datatype-aware REPLY producers | `XEP/xtXEP_source-3/xtSerial/src/protocol_target.c`: `createReplyIntCommand`, `createReplyByteCommand`, `createReplyStringnCommand`, `createReplyFloatCommand` |
+| X4M200 application commands | `XEP/xtXEP_source-3/xtSerial/src/protocol.c`: `createLoadProfileCommand`, `createGetDetectionZoneCommand`, `createGetDetectionZoneLimitsCommand`, output-control and noisemap builders |
+| X4Driver getters and register operations | `XEP/xtXEP_source-3/xtSerial/src/protocol.c`: `createX4DriverGet*Command`, `createX4DriverReadFromSpiRegisterCommand`, `createX4DriverWriteToSpiRegisterCommand` |
+| Filesystem commands | `XEP/xtXEP_source-3/xtSerial/src/protocol.c`: `createSearchForFileTypeCommand` through `createFormatFilesystemCommand`; callbacks in `xtXEP/src/XEPA/xep_application_mcp_callbacks.c` |
+| GPIO commands | `XEP/xtXEP_source-3/xtSerial/src/protocol.c`: `createSetIOPinControlCommand`, `createGetIOPinControlCommand`, `createSetIOPinValueCommand`, `createGetIOPinValueCommand` |
 | DataFloat classic layout | `XEP/xtXEP_source-3/xtSerial/src/protocol_target.c`: `createDataFloatCommand`; host `protocol_host_parser.c`: `parse_data_float` |
 | DataFloat no-escape layout | `XEP/xtXEP_source-3/xtSerial/src/protocol_target.c`: `createDataFloatCommandNoEscape` |
 | Baseband IQ APPDATA layout | `XEP/xtXEP_source-3/xtSerial/src/protocol_target.c`: `createAppdataBasebandIQCommand`, `createAppdataBasebandIQCommandNoEscape`; host `protocol_host_parser.c`: `parse_baseband_iq` |
 | SleepStatus layout | `XEP/xtXEP_source-3/xtSerial/src/protocol_target.c`: `createAppdataSleepCommand`; host `protocol_host_parser.c`: `parse_sleep_status` |
+| Respiration and vital-sign layouts | `XEP/xtXEP_source-3/xtSerial/src/protocol_target.c`: respiration, moving-list, detection-list, normalized-list, and vital-sign builders |
+| Pulse-Doppler and noisemap layouts | `XEP/xtXEP_source-3/xtSerial/src/protocol_target.c`: float builders and `_createAppdataPDMatCommandNoEscape`, `_createAppdataPDMatByteCommandNoEscape` |
+| Legacy recording field order | `Legacy-Documentation/Application-Notes/XTAN-05_XeThruFileFormats-v2.pdf`, sections 2.1-2.2, pages 4-5 |
 | Raw-data initialization defaults and order | `ModuleConnector/Latest_MC_examples/PYTHON/xt_modules_plot_record_playback_radar_raw_data_message_2D.py`: `x4_par_settings`, `configure_x4` |
 | Single ordered serial reader and command serialization | `MCPWrapper/mcp_wrapper_1.3.1/examples/generic/src/main.cpp`: `readThreadMethod`, wrapper command methods; `LinuxModuleIo.cpp`: `read`, `write`, `setBaudrate` |
 | Wrapper response routing and 2 s timeout | `MCPWrapper/mcp_wrapper_1.3.1/src/mcp_wrapper.c`: `mcpw_init`, `mcpw_mcp_handle_protocol_packet`, ACK/ERROR/REPLY callbacks |
 | Public wrapper behavior used for cross-checking | `MCPWrapper/mcp_wrapper_1.3.1/include/mcp_wrapper.h` |
 | Reused license text | `MCPWrapper/mcp_wrapper_1.3.1/LICENSE.md` |
-

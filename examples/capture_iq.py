@@ -1,7 +1,7 @@
 from pathlib import Path
 
-from x4cir import X4M200, X4Config
-from x4cir.recording import save_npz
+from mxs import X4M200, X4Config
+from mxs.recording import save_npz
 
 config = X4Config(downconversion=True)
 with X4M200() as radar:
