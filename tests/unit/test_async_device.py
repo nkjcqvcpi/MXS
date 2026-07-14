@@ -1,8 +1,11 @@
+# pyright: reportPrivateUsage=false
+
 import asyncio
 
 import pytest
 
 from mxs import AsyncX4M200, X4Config
+from mxs.constants import DeviceState
 from mxs.framing import encode_classic_frame
 from tests.conftest import FakeSerialFactory
 
@@ -96,3 +99,26 @@ async def test_close_wakes_bridge_when_async_queue_is_full() -> None:
     await radar.start()
     await asyncio.sleep(0.02)
     await radar.close()
+
+
+@pytest.mark.asyncio
+async def test_close_clears_async_state_after_session_close_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    radar = AsyncX4M200(port="fake", serial_factory=FakeSerialFactory())
+    await radar.open()
+    original_close = radar._session.close
+    shutdown_error = RuntimeError("injected session close failure")
+
+    def fail_after_close() -> None:
+        original_close()
+        raise shutdown_error
+
+    monkeypatch.setattr(radar._session, "close", fail_after_close)
+    with pytest.raises(RuntimeError) as captured:
+        await radar.close()
+    assert captured.value is shutdown_error
+    assert radar._session.state is DeviceState.CLOSED
+    assert radar._bridge_thread is None
+    assert radar._async_frames is None
+    assert radar._loop is None

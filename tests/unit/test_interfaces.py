@@ -1,9 +1,14 @@
+import threading
 from typing import cast
 
 import numpy as np
 import pytest
 
-from mxs.errors import UnsafeOperationDisabledError, UnsupportedFirmwareError
+from mxs.errors import (
+    InvalidDeviceStateError,
+    UnsafeOperationDisabledError,
+    UnsupportedFirmwareError,
+)
 from mxs.expectations import ResponseExpectation
 from mxs.interfaces import (
     FilesystemInterface,
@@ -24,6 +29,8 @@ class StubSession:
     def __init__(self) -> None:
         self.calls: list[tuple[str, bytes]] = []
         self.high_baud = False
+        self.filesystem_lock = threading.RLock()
+        self.sensor_mode = 0x13
 
     def execute(self, name: str, packet: bytes, expectation: ResponseExpectation):
         self.calls.append((name, packet))
@@ -38,6 +45,8 @@ class StubSession:
         if reply_class is StringReply:
             return StringReply(content_id, info, 6, 1, "X4M200")
         if reply_class is ByteReply:
+            if name == "unsafe_get_sensor_mode":
+                return ByteReply(content_id, info, 1, 1, bytes((self.sensor_mode,)))
             return ByteReply(content_id, info, count, 1, bytes(range(1, count + 1)))
         if reply_class is FloatReply:
             if content_id == 0x96A10A1D:
@@ -182,9 +191,61 @@ def test_filesystem_and_unsafe_gates(
     unsafe.filesystem_admin.set_file_data(1, 2, 0, b"data")
     unsafe.filesystem_admin.close_file(1, 2, commit=True)
     unsafe.filesystem_admin.set_file(1, 2, b"data")
-    names = [name for name, _packet in cast(StubSession, session).calls]
+    names = [
+        name
+        for name, _packet in cast(StubSession, session).calls
+        if name != "unsafe_get_sensor_mode"
+    ]
     assert names[-3:] == ["create_file", "set_file_data", "close_file"]
     unsafe.filesystem_admin.delete_file(1, 2)
     monkeypatch.setenv("MXS_ENABLE_FRAME_INJECTION", "1")
     unsafe.prepare_inject_frame(1, 2, 0)
     unsafe.inject_frame(1, 2, np.zeros(4, np.float32))
+
+
+def test_unsafe_command_checks_actual_sensor_mode(
+    session: DeviceSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stub = cast(StubSession, session)
+    stub.sensor_mode = 0x01
+    monkeypatch.setenv("MXS_ENABLE_BOOTLOADER", "1")
+    with pytest.raises(InvalidDeviceStateError, match="actual sensor mode is RUN"):
+        UnsafeInterface(session).start_bootloader(key=1)
+    assert [name for name, _packet in stub.calls] == ["unsafe_get_sensor_mode"]
+
+    monkeypatch.setenv("MXS_ENABLE_FRAME_INJECTION", "1")
+    stub.sensor_mode = 0x12
+    UnsafeInterface(session).prepare_inject_frame(1, 2, 0)
+
+
+def test_filesystem_read_cannot_interleave_set_file_transaction(
+    session: DeviceSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stub = cast(StubSession, session)
+    entered_write = threading.Event()
+    release_write = threading.Event()
+    original_execute = stub.execute
+
+    def execute(name: str, packet: bytes, expectation: ResponseExpectation):
+        if name == "set_file_data":
+            entered_write.set()
+            assert release_write.wait(1)
+        return original_execute(name, packet, expectation)
+
+    stub.execute = execute  # type: ignore[method-assign]
+    monkeypatch.setenv("MXS_ENABLE_UNSAFE", "1")
+    admin = UnsafeInterface(session).filesystem_admin
+    reader = FilesystemInterface(session)
+    writer_thread = threading.Thread(target=admin.set_file, args=(1, 2, b"data"))
+    reader_thread = threading.Thread(target=reader.find_all_files)
+    writer_thread.start()
+    assert entered_write.wait(1)
+    reader_thread.start()
+    assert not any(name == "find_all_files" for name, _packet in stub.calls)
+    release_write.set()
+    writer_thread.join(1)
+    reader_thread.join(1)
+    assert not writer_thread.is_alive()
+    assert not reader_thread.is_alive()
+    actions = [name for name, _packet in stub.calls if name != "unsafe_get_sensor_mode"]
+    assert actions == ["create_file", "set_file_data", "close_file", "find_all_files"]

@@ -27,6 +27,7 @@ below are read-only sources under `./Legacy-SW`.
 | Baseband IQ APPDATA layout | `XEP/xtXEP_source-3/xtSerial/src/protocol_target.c`: `createAppdataBasebandIQCommand`, `createAppdataBasebandIQCommandNoEscape`; host `protocol_host_parser.c`: `parse_baseband_iq` |
 | SleepStatus layout | `XEP/xtXEP_source-3/xtSerial/src/protocol_target.c`: `createAppdataSleepCommand`; host `protocol_host_parser.c`: `parse_sleep_status` |
 | Respiration and vital-sign layouts | `XEP/xtXEP_source-3/xtSerial/src/protocol_target.c`: respiration, moving-list, detection-list, normalized-list, and vital-sign builders |
+| Extended-respiration identifier only | `MCPWrapper/mcp_wrapper_1.3.1/src/mcp/xtid.h`: `XTS_ID_RESP_STATUS_EXT`; no checked-in target producer, parser, structure, or example defines a payload |
 | Pulse-Doppler and noisemap layouts | `XEP/xtXEP_source-3/xtSerial/src/protocol_target.c`: float builders and `_createAppdataPDMatCommandNoEscape`, `_createAppdataPDMatByteCommandNoEscape` |
 | Legacy recording field order | `Legacy-Documentation/Application-Notes/XTAN-05_XeThruFileFormats-v2.pdf`, sections 2.1-2.2, pages 4-5 |
 | Raw-data initialization defaults and order | `ModuleConnector/Latest_MC_examples/PYTHON/xt_modules_plot_record_playback_radar_raw_data_message_2D.py`: `x4_par_settings`, `configure_x4` |

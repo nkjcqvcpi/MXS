@@ -30,9 +30,18 @@ from mxs.commands import (
     build_x4_read,
     build_x4_write,
 )
+from mxs.constants import ProfileId
 
 
 def test_extended_command_builders_and_validation() -> None:
+    assert {member.name: int(member) for member in ProfileId} == {
+        "RESPIRATION": 0x1423A2D6,
+        "SLEEP": 0x00F17B17,
+        "RESPIRATION_2": 0x064E57AD,
+        "RESPIRATION_3": 0x47FABEBA,
+        "RESPIRATION_4": 0x4AC5D074,
+        "RESPIRATION_5": 0xA9E03260,
+    }
     builders = (
         build_get_sensor_mode(),
         build_load_profile(1),

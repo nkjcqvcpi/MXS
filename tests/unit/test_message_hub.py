@@ -111,6 +111,24 @@ async def test_cancelled_selected_waiter_preserves_message() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cancelled_waiter_never_blocks_loop_when_blocking_queue_is_full() -> None:
+    subscription = Subscription[int](1, "block_with_timeout", block_timeout=1.0)
+    pending = asyncio.create_task(subscription.read_async())
+    await asyncio.sleep(0)
+    subscription.publish(1)
+    pending.cancel()
+    subscription.publish(2)
+    ticked = asyncio.Event()
+    asyncio.get_running_loop().call_soon(ticked.set)
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    await asyncio.wait_for(ticked.wait(), 0.1)
+    await asyncio.sleep(0)
+    with pytest.raises(MessageQueueOverflowError):
+        subscription.read()
+
+
+@pytest.mark.asyncio
 async def test_publish_read_stress_10000() -> None:
     subscription = Subscription[int](10_000, "error")
     publisher = threading.Thread(

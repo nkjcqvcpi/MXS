@@ -30,6 +30,7 @@ class FakeSerial:
         self.disconnected = False
         self.reject_next = False
         self.suppress_next_response = False
+        self.suppress_all_responses = False
         self.delay_ack = 0.0
         self.writes: list[bytes] = []
         self._incoming: deque[int] = deque(SLEEP_FRAME if initial_stream else b"")
@@ -61,6 +62,8 @@ class FakeSerial:
         return len(chunk)
 
     def _respond(self, packet: bytes) -> None:
+        if self.suppress_all_responses:
+            return
         if self.suppress_next_response:
             self.suppress_next_response = False
             return

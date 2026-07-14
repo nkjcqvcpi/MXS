@@ -61,11 +61,13 @@ async with AsyncX4M200(port=port) as radar:
 
 `.mcpbin` recording uses a bounded writer queue, monotonic timestamps, RX/TX direction fields, metadata, a clean-close marker, and truncated-file recovery. Parsed-message recording stores versioned JSONL metadata and independent `.npy` arrays; `mxs record-messages` and `mxs replay-messages` expose that format. Chunked CIR recording writes independently readable NumPy files. `mxs.recording.legacy` reads the self-delimiting baseband IQ and amplitude/phase formats documented by XTAN-05; it rejects legacy formats whose record envelope is not sufficiently specified.
 
+The compatibility `raw_chunk_callback` receives RX bytes only. Use `wire_chunk_callback` when a recorder or diagnostic needs timestamped RX and TX `WireChunk` objects.
+
 Host processing is opt-in. `mxs.processing` provides IQ/amplitude/phase conversion, phase unwrap, range axes, normalization, filtering, spectra, resampling, peaks, analytic signals, and an ordered bounded thread/process pipeline. Acquisition never applies filters automatically.
 
 ## Safety and firmware
 
-Unsafe namespaces require operation-specific environment gates. Factory reset, bootloader entry, filesystem mutation/formatting, raw register writes, frame injection, manufacturing tests, and noisemap flash writes are disabled by default. See [hardware safety](docs/hardware-safety.md) before enabling any gate.
+Unsafe namespaces require operation-specific environment gates and verify the device-reported sensor mode before sending a destructive command. Factory reset, bootloader entry, filesystem mutation/formatting, raw register writes, frame injection, manufacturing tests, and noisemap flash writes are disabled by default. See [hardware safety](docs/hardware-safety.md) before enabling any gate.
 
 Any command timeout marks the session desynchronized, closes the transport, and rejects further commands. Call `recover()` to reprobe and restore STOP state. A disconnect wakes pending consumers; close and reopen the same object to rebuild workers and subscriptions.
 
@@ -81,4 +83,4 @@ uv run pytest -m "not hardware and not soak and not unsafe" --cov=mxs
 uv build
 ```
 
-Protocol provenance is recorded in [source map](docs/source-map.md), [protocol notes](docs/protocol-notes.md), and [upstream sources](docs/upstream-sources.md). Migration details are in [0.1 to 0.2 migration](docs/migration-0.1-to-0.2.md).
+Protocol provenance is recorded in [source map](docs/source-map.md), [protocol notes](docs/protocol-notes.md), and [upstream sources](docs/upstream-sources.md). Release-specific changes are in [the 0.2.2 migration guide](docs/migration-0.2.1-to-0.2.2.md).

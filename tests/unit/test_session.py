@@ -13,7 +13,14 @@ from mxs.errors import (
 )
 from mxs.session import DeviceSession
 from mxs.transport import WireChunk
-from tests.conftest import FakeSerialFactory
+from tests.conftest import FakeSerial, FakeSerialFactory
+
+
+class BaudSelectiveFactory(FakeSerialFactory):
+    def __call__(self, port: str, baudrate: int) -> FakeSerial:
+        serial = super().__call__(port, baudrate)
+        serial.suppress_all_responses = baudrate == 115200
+        return serial
 
 
 def test_fake_serial_full_lifecycle_and_partial_io() -> None:
@@ -39,6 +46,17 @@ def test_reopen_same_object_builds_fresh_workers_and_subscriptions() -> None:
     radar.close()
     radar.open()
     assert radar.messages is not first_messages
+    radar.close()
+
+
+def test_auto_baud_uses_fresh_runtime_after_wrong_baud_timeout() -> None:
+    factory = BaudSelectiveFactory(initial_stream=False)
+    radar = X4M200(port="fake", baudrate="auto", command_timeout=0.2, serial_factory=factory)
+    radar.open()
+    assert radar.detected_baudrate == 921600
+    assert [serial.baudrate for serial in factory.instances] == [115200, 921600]
+    assert factory.instances[0].closed
+    assert radar.module.ping().ready
     radar.close()
 
 
@@ -117,6 +135,76 @@ def test_transport_records_rx_and_tx_at_io_boundary() -> None:
     radar.close()
     assert {chunk.direction for chunk in chunks} == {"rx", "tx"}
     assert all(chunk.timestamp_monotonic_ns > 0 and chunk.data for chunk in chunks)
+
+
+def test_legacy_raw_callback_receives_rx_only() -> None:
+    raw_chunks: list[bytes] = []
+    wire_chunks: list[WireChunk] = []
+    session = DeviceSession(
+        "fake",
+        115200,
+        serial_factory=FakeSerialFactory(initial_stream=False),
+        raw_chunk_callback=raw_chunks.append,
+        wire_chunk_callback=wire_chunks.append,
+    )
+    session.open()
+    session.close()
+    assert raw_chunks
+    assert {chunk.direction for chunk in wire_chunks} == {"rx", "tx"}
+    assert b"".join(raw_chunks) == b"".join(
+        chunk.data for chunk in wire_chunks if chunk.direction == "rx"
+    )
+
+
+def test_close_cleans_state_after_worker_close_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = DeviceSession("fake", 115200, serial_factory=FakeSerialFactory())
+    session.open()
+    worker = session.worker
+    assert worker is not None
+    original_close = worker.close
+    shutdown_error = RuntimeError("injected worker close failure")
+
+    def fail_after_close(timeout: float = 3.0) -> None:
+        original_close(timeout)
+        raise shutdown_error
+
+    monkeypatch.setattr(worker, "close", fail_after_close)
+    with pytest.raises(RuntimeError) as captured:
+        session.close()
+    assert captured.value is shutdown_error
+    assert session.state is DeviceState.CLOSED
+    assert session.worker is None
+    assert session.frames.closed
+
+    passive = DeviceSession("fake", 115200, serial_factory=FakeSerialFactory())
+    passive.open()
+    passive_worker = passive.worker
+    assert passive_worker is not None
+    original_passive_close = passive_worker.close
+
+    def fail_passive_after_close(timeout: float = 3.0) -> None:
+        original_passive_close(timeout)
+        raise shutdown_error
+
+    monkeypatch.setattr(passive_worker, "close", fail_passive_after_close)
+    with pytest.raises(RuntimeError) as passive_captured:
+        passive.close_passive()
+    assert passive_captured.value is shutdown_error
+    assert passive.state is DeviceState.CLOSED
+    assert passive.worker is None
+    assert passive.frames.closed
+
+
+def test_recording_failure_fails_session_and_wakes_consumers() -> None:
+    session = DeviceSession("fake", 115200, serial_factory=FakeSerialFactory())
+    session.open()
+    recording_error = OSError("injected recorder failure")
+    session.recording_failed(recording_error)
+    assert session.state is DeviceState.ERROR
+    assert session.frames.queue.get(timeout=1) is recording_error
+    session.close()
 
 
 def test_start_frame_timeout_read_timeout_and_passive_close() -> None:

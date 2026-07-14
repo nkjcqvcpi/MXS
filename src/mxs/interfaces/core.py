@@ -2,7 +2,6 @@
 
 import os
 import struct
-import threading
 from contextlib import suppress
 from typing import ClassVar, Never
 
@@ -106,6 +105,7 @@ class Interface:
         *,
         allowed_states: set[DeviceState],
         confirmation: bool | None = None,
+        allow_manual: bool = False,
     ) -> None:
         state = getattr(self._session, "state", DeviceState.OPEN)
         if os.environ.get(gate) != "1":
@@ -124,6 +124,22 @@ class Interface:
             raise InvalidDeviceStateError(f"{gate} operation requires a healthy serial session")
         if confirmation is False:
             raise ValueError(f"explicit confirmation is required for {gate}")
+        result = self._reply(
+            "unsafe_get_sensor_mode",
+            build_get_sensor_mode(),
+            reply(ByteReply, 0, element_count=1),
+        )
+        assert isinstance(result, ByteReply)
+        sensor_mode = SensorMode(result.values[0])
+        allowed_modes = {SensorMode.STOP}
+        if allow_manual:
+            allowed_modes.add(SensorMode.MANUAL)
+        if sensor_mode not in allowed_modes:
+            expected = "STOP or MANUAL" if allow_manual else "STOP"
+            raise InvalidDeviceStateError(
+                f"{gate} operation requires sensor mode {expected}; "
+                f"actual sensor mode is {sensor_mode.name}"
+            )
 
 
 class ModuleInterface(Interface):
@@ -474,14 +490,14 @@ class NoisemapInterface(Interface):
     def store_noisemap(self) -> None:
         self._require_unsafe(
             "MXS_ENABLE_NOISEMAP_FLASH_WRITE",
-            allowed_states={DeviceState.OPEN, DeviceState.STOPPED, DeviceState.MANUAL},
+            allowed_states={DeviceState.OPEN, DeviceState.STOPPED},
         )
         self._ack("store_noisemap", build_app_action(0x13))
 
     def delete_noisemap(self) -> None:
         self._require_unsafe(
             "MXS_ENABLE_NOISEMAP_FLASH_WRITE",
-            allowed_states={DeviceState.OPEN, DeviceState.STOPPED, DeviceState.MANUAL},
+            allowed_states={DeviceState.OPEN, DeviceState.STOPPED},
         )
         self._ack("delete_noisemap", build_app_action(0x16))
 
@@ -522,7 +538,15 @@ class ParametersInterface(Interface):
 class FilesystemInterface(Interface):
     CHUNK_SIZE = 1024
 
+    def __init__(self, session: DeviceSession) -> None:
+        super().__init__(session)
+        self._filesystem_lock = session.filesystem_lock
+
     def search_for_file_by_type(self, file_type: int) -> list[FileIdentifier]:
+        with self._filesystem_lock:
+            return self._search_for_file_by_type_unlocked(file_type)
+
+    def _search_for_file_by_type_unlocked(self, file_type: int) -> list[FileIdentifier]:
         result = self._reply(
             "search_for_file_by_type", build_filesystem(0x64, file_type), reply(IntReply, 0)
         )
@@ -530,6 +554,10 @@ class FilesystemInterface(Interface):
         return [FileIdentifier(file_type, int(value)) for value in result.values]
 
     def find_all_files(self) -> list[FileIdentifier]:
+        with self._filesystem_lock:
+            return self._find_all_files_unlocked()
+
+    def _find_all_files_unlocked(self) -> list[FileIdentifier]:
         result = self._reply("find_all_files", build_filesystem(0x65), reply(IntReply, 0))
         assert isinstance(result, IntReply)
         count = result.element_count // 2
@@ -539,6 +567,10 @@ class FilesystemInterface(Interface):
         ]
 
     def get_file_length(self, file_type: int, identifier: int) -> int:
+        with self._filesystem_lock:
+            return self._get_file_length_unlocked(file_type, identifier)
+
+    def _get_file_length_unlocked(self, file_type: int, identifier: int) -> int:
         result = self._reply(
             "get_file_length",
             build_filesystem(0x69, file_type, identifier),
@@ -548,6 +580,12 @@ class FilesystemInterface(Interface):
         return int(result.values[0])
 
     def get_file_data(self, file_type: int, identifier: int, offset: int, length: int) -> bytes:
+        with self._filesystem_lock:
+            return self._get_file_data_unlocked(file_type, identifier, offset, length)
+
+    def _get_file_data_unlocked(
+        self, file_type: int, identifier: int, offset: int, length: int
+    ) -> bytes:
         if min(offset, length) < 0:
             raise ValueError("offset and length must be nonnegative")
         result = bytearray()
@@ -563,9 +601,13 @@ class FilesystemInterface(Interface):
         return bytes(result)
 
     def get_file(self, file_type: int, identifier: int) -> DeviceFile:
-        length = self.get_file_length(file_type, identifier)
-        metadata = FileMetadata(FileIdentifier(file_type, identifier), length)
-        return DeviceFile(metadata, self.get_file_data(file_type, identifier, 0, length))
+        with self._filesystem_lock:
+            length = self._get_file_length_unlocked(file_type, identifier)
+            metadata = FileMetadata(FileIdentifier(file_type, identifier), length)
+            return DeviceFile(
+                metadata,
+                self._get_file_data_unlocked(file_type, identifier, 0, length),
+            )
 
 
 class UnsafeInterface(Interface):
@@ -603,6 +645,7 @@ class UnsafeInterface(Interface):
         self._require_unsafe(
             "MXS_ENABLE_FRAME_INJECTION",
             allowed_states={DeviceState.OPEN, DeviceState.STOPPED, DeviceState.MANUAL},
+            allow_manual=True,
         )
         self._ack("prepare_inject_frame", build_prepare_inject_frame(num_frames, num_bins, mode))
 
@@ -610,6 +653,7 @@ class UnsafeInterface(Interface):
         self._require_unsafe(
             "MXS_ENABLE_FRAME_INJECTION",
             allowed_states={DeviceState.OPEN, DeviceState.STOPPED, DeviceState.MANUAL},
+            allow_manual=True,
         )
         values = np.asarray(frame, dtype="<f4")
         self._ack(
@@ -629,6 +673,7 @@ class RegisterInterface(Interface):
         self._require_unsafe(
             "MXS_ENABLE_RAW_REGISTER_WRITES",
             allowed_states={DeviceState.OPEN, DeviceState.STOPPED, DeviceState.MANUAL},
+            allow_manual=True,
         )
 
     def x4driver_get_spi_register(self, address: int) -> int:
@@ -704,14 +749,10 @@ class RegisterInterface(Interface):
 
 
 class FilesystemAdminInterface(FilesystemInterface):
-    def __init__(self, session: DeviceSession) -> None:
-        super().__init__(session)
-        self._transaction_lock = threading.Lock()
-
     def _guard(self, gate: str = "MXS_ENABLE_UNSAFE", confirmation: bool | None = None) -> None:
         self._require_unsafe(
             gate,
-            allowed_states={DeviceState.OPEN, DeviceState.STOPPED, DeviceState.MANUAL},
+            allowed_states={DeviceState.OPEN, DeviceState.STOPPED},
             confirmation=confirmation,
         )
 
@@ -722,15 +763,29 @@ class FilesystemAdminInterface(FilesystemInterface):
         return value
 
     def create_file(self, file_type: int, identifier: int, length: int) -> None:
+        with self._filesystem_lock:
+            self._create_file_unlocked(file_type, identifier, length)
+
+    def _create_file_unlocked(self, file_type: int, identifier: int, length: int) -> None:
         self._guard()
         self._u32(length, "length")
         self._ack("create_file", build_filesystem(0x66, file_type, identifier, length))
 
     def open_file(self, file_type: int, identifier: int) -> None:
+        with self._filesystem_lock:
+            self._open_file_unlocked(file_type, identifier)
+
+    def _open_file_unlocked(self, file_type: int, identifier: int) -> None:
         self._guard()
         self._ack("open_file", build_filesystem(0x72, file_type, identifier))
 
     def set_file_data(self, file_type: int, identifier: int, offset: int, data: bytes) -> None:
+        with self._filesystem_lock:
+            self._set_file_data_unlocked(file_type, identifier, offset, data)
+
+    def _set_file_data_unlocked(
+        self, file_type: int, identifier: int, offset: int, data: bytes
+    ) -> None:
         self._guard()
         self._u32(offset, "offset")
         if offset + len(data) > 0xFFFFFFFF:
@@ -750,24 +805,33 @@ class FilesystemAdminInterface(FilesystemInterface):
             )
 
     def close_file(self, file_type: int, identifier: int, *, commit: bool) -> None:
+        with self._filesystem_lock:
+            self._close_file_unlocked(file_type, identifier, commit=commit)
+
+    def _close_file_unlocked(self, file_type: int, identifier: int, *, commit: bool) -> None:
         self._guard()
         self._ack("close_file", build_filesystem(0x68, file_type, identifier, int(commit)))
 
     def set_file(self, file_type: int, identifier: int, data: bytes) -> None:
-        with self._transaction_lock:
-            self.create_file(file_type, identifier, len(data))
+        with self._filesystem_lock:
+            self._create_file_unlocked(file_type, identifier, len(data))
             try:
-                self.set_file_data(file_type, identifier, 0, data)
+                self._set_file_data_unlocked(file_type, identifier, 0, data)
             except BaseException:
                 with suppress(BaseException):
-                    self.close_file(file_type, identifier, commit=False)
+                    self._close_file_unlocked(file_type, identifier, commit=False)
                 raise
-            self.close_file(file_type, identifier, commit=True)
+            self._close_file_unlocked(file_type, identifier, commit=True)
 
     def format_filesystem(self, *, key: int) -> None:
-        self._guard("MXS_ENABLE_FILESYSTEM_FORMAT", confirmation=key != 0)
-        self._ack("format_filesystem", build_filesystem(0x73, key))
+        with self._filesystem_lock:
+            self._guard("MXS_ENABLE_FILESYSTEM_FORMAT", confirmation=key != 0)
+            self._ack("format_filesystem", build_filesystem(0x73, key))
 
     def delete_file(self, file_type: int, identifier: int) -> None:
+        with self._filesystem_lock:
+            self._delete_file_unlocked(file_type, identifier)
+
+    def _delete_file_unlocked(self, file_type: int, identifier: int) -> None:
         self._guard()
         self._ack("delete_file", build_filesystem(0x70, file_type, identifier))

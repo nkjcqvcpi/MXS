@@ -2,6 +2,7 @@
 
 import logging
 import queue
+import threading
 import time
 from collections.abc import Callable
 from contextlib import suppress
@@ -60,8 +61,8 @@ class DeviceSession:
         self.statistics_tracker = StatisticsTracker()
         self._frame_queue_size: int = frame_queue_size
         self._overflow_policy: QueuePolicy = overflow_policy
-        self._opened_once = False
         self._reprobe_all_baudrates = False
+        self.filesystem_lock = threading.RLock()
         self.command_manager: CommandManager
         self.router: MessageRouter
         self.frames: FrameSubscription
@@ -92,8 +93,6 @@ class DeviceSession:
 
     def open(self) -> None:
         self._require(DeviceState.CLOSED)
-        if self._opened_once:
-            self._build_runtime()
         candidates = (
             (115200, 921600)
             if self.requested_baudrate == "auto" or self._reprobe_all_baudrates
@@ -101,42 +100,56 @@ class DeviceSession:
         )
         failures: list[str] = []
         for baudrate in candidates:
-            baseline = self.router.valid_packet_count
-            worker = SerialWorker(
-                self.port,
-                baudrate,
-                self.router,
-                self.statistics_tracker,
-                serial_factory=self.serial_factory,
-                raw_chunk_callback=self.raw_chunk_callback,
-                wire_chunk_callback=self.wire_chunk_callback,
-            )
+            with suppress(BaseException):
+                self.router.close()
+            self._build_runtime()
+            worker = self._create_worker(baudrate)
             try:
-                worker.start()
+                self._probe_candidate(worker)
                 self.worker = worker
-                deadline = time.monotonic() + (0.7 if self.requested_baudrate == "auto" else 0.1)
-                while time.monotonic() < deadline and self.router.valid_packet_count == baseline:
-                    time.sleep(0.01)
-                if self.router.valid_packet_count == baseline:
-                    self.command_manager.execute(
-                        "PING",
-                        build_ping(),
-                        worker.send,
-                        self.command_timeout,
-                        expect_pong=True,
-                    )
                 self.detected_baudrate = baudrate
                 self._transition(DeviceState.OPEN)
-                self._opened_once = True
                 self._reprobe_all_baudrates = False
                 LOGGER.info("detected %d baud", baudrate)
                 return
             except BaseException as error:
                 failures.append(f"{baudrate}: {error}")
-                with suppress(BaseException):
-                    worker.close()
-                self.worker = None
+                self._close_candidate(worker)
         raise BaudDetectionError("; ".join(failures))
+
+    def _create_worker(self, baudrate: int) -> SerialWorker:
+        return SerialWorker(
+            self.port,
+            baudrate,
+            self.router,
+            self.statistics_tracker,
+            serial_factory=self.serial_factory,
+            raw_chunk_callback=self.raw_chunk_callback,
+            wire_chunk_callback=self.wire_chunk_callback,
+        )
+
+    def _probe_candidate(self, worker: SerialWorker) -> None:
+        baseline = self.router.valid_packet_count
+        worker.start()
+        deadline = time.monotonic() + (0.7 if self.requested_baudrate == "auto" else 0.1)
+        while time.monotonic() < deadline and self.router.valid_packet_count == baseline:
+            time.sleep(0.01)
+        if self.router.valid_packet_count == baseline:
+            self.command_manager.execute(
+                "PING",
+                build_ping(),
+                worker.send,
+                self.command_timeout,
+                expect_pong=True,
+            )
+
+    def _close_candidate(self, worker: SerialWorker) -> None:
+        with suppress(BaseException):
+            worker.close()
+        with suppress(BaseException):
+            self.router.close()
+        self.worker = None
+        self.state = DeviceState.CLOSED
 
     def configure(self, config: X4Config) -> None:
         # Reference: ./Legacy-SW/ModuleConnector/Latest_MC_examples/PYTHON/
@@ -235,30 +248,54 @@ class DeviceSession:
         if self.state is DeviceState.CLOSED:
             return
         self._transition(DeviceState.CLOSING)
-        if self.worker is not None:
-            if self.worker.alive:
+        worker = self.worker
+        first_error: BaseException | None = None
+        if worker is not None:
+            if worker.alive:
                 self._best_effort("FPS 0", build_set_fps(0))
                 self._best_effort("STOP", build_set_sensor_mode(SensorMode.STOP))
-            self.worker.close()
-        self.router.close()
-        self.worker = None
-        self._transition(DeviceState.CLOSED)
+            try:
+                worker.close()
+            except BaseException as error:
+                first_error = error
+        try:
+            self.router.close()
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+        finally:
+            self.worker = None
+            self._transition(DeviceState.CLOSED)
+        if first_error is not None:
+            raise first_error
 
     def close_passive(self) -> None:
         """Close without transmitting; used only by sniffing and probing."""
         if self.state is DeviceState.CLOSED:
             return
         self._transition(DeviceState.CLOSING)
-        if self.worker is not None:
-            self.worker.close()
-        self.router.close()
-        self.worker = None
-        self._transition(DeviceState.CLOSED)
+        worker = self.worker
+        first_error: BaseException | None = None
+        if worker is not None:
+            try:
+                worker.close()
+            except BaseException as error:
+                first_error = error
+        try:
+            self.router.close()
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+        finally:
+            self.worker = None
+            self._transition(DeviceState.CLOSED)
+        if first_error is not None:
+            raise first_error
 
     def recover(self) -> None:
         """Discard a desynchronized transport and reopen in a known STOP state."""
         if self.state is not DeviceState.DESYNCHRONIZED:
-            raise InvalidDeviceStateError("recover() is only valid after an ACK timeout")
+            raise InvalidDeviceStateError("recover() is only valid after a command timeout")
         if self.worker is not None:
             with suppress(BaseException):
                 self.worker.close()

@@ -15,4 +15,4 @@ The following operations are disabled unless their exact gate is `1`:
 | Manufacturing test | `MXS_ENABLE_MANUFACTURING_TESTS` |
 | Noisemap flash store or deletion | `MXS_ENABLE_NOISEMAP_FLASH_WRITE` |
 
-Do not enable a gate while streaming. Do not guess register addresses, test codes, bootloader keys, or safe alternative values. Default hardware tests never store or delete a noisemap, mutate files, enter a bootloader, reset factory state, inject frames, or write registers.
+MXS checks the device-reported sensor mode after checking a gate. Filesystem and noisemap mutations, formatting, bootloader entry, factory reset, and manufacturing tests require STOP. Frame injection and raw register writes permit STOP or MANUAL because their local XEP workflows define MANUAL use. Do not guess register addresses, test codes, bootloader keys, or safe alternative values. Default hardware tests never store or delete a noisemap, mutate files, enter a bootloader, reset factory state, inject frames, or write registers.

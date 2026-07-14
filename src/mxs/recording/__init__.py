@@ -41,6 +41,7 @@ class WireRecorder:
         self._lock = threading.Lock()
         self._queue: queue.Queue[WireChunk | None] = queue.Queue(queue_capacity)
         self._thread = threading.Thread(target=self._run, name="mxs-wire-writer", daemon=False)
+        self._stop = threading.Event()
         self._error: BaseException | None = None
         self._bytes_written = 0
         self._queue_high_water_mark = 0
@@ -86,6 +87,8 @@ class WireRecorder:
             raise RuntimeError("wire recorder is not open")
         if self._error is not None:
             raise self._error
+        if self._stop.is_set():
+            raise RuntimeError("wire recorder is closing")
         if isinstance(chunk, bytes):
             chunk = WireChunk(time.monotonic_ns(), cast("Literal['rx', 'tx']", direction), chunk)
         if chunk.direction not in ("rx", "tx"):
@@ -103,21 +106,52 @@ class WireRecorder:
             raise recording_error from error
 
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
-        if self._file is not None:
-            self._queue.put(None)
-            self._thread.join(5.0)
+        target = self._file
+        if target is None:
+            return
+        first_error = self._error
+        try:
+            if first_error is not None:
+                self._stop.set()
+            if self._thread.is_alive() and first_error is None:
+                try:
+                    self._queue.put(None, timeout=0.25)
+                except queue.Full:
+                    from ..errors import RecordingBackpressureError
+
+                    first_error = RecordingBackpressureError(
+                        "wire recording queue remained full during close"
+                    )
+                    self._stop.set()
             if self._thread.is_alive():
-                raise RuntimeError("wire recording worker failed to terminate")
-            if self._error is not None:
-                raise self._error
-            self._file.flush()
-            self._file.close()
+                self._thread.join(5.0)
+            if self._thread.is_alive() and first_error is None:
+                first_error = RuntimeError("wire recording worker failed to terminate")
+            if first_error is None and self._error is not None:
+                first_error = self._error
+            try:
+                target.flush()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        finally:
+            self._stop.set()
+            try:
+                target.close()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
             self._file = None
+        if first_error is not None:
+            raise first_error
 
     def _run(self) -> None:
         try:
-            while True:
-                item = self._queue.get()
+            while not self._stop.is_set():
+                try:
+                    item = self._queue.get(timeout=0.05)
+                except queue.Empty:
+                    continue
                 if item is None:
                     with self._lock:
                         assert self._file is not None
@@ -133,6 +167,7 @@ class WireRecorder:
                     self._bytes_written += len(item.data)
         except BaseException as error:
             self._error = error
+            self._stop.set()
             if self._fatal_callback is not None:
                 self._fatal_callback(error)
 
@@ -215,6 +250,7 @@ class ChunkedCirRecorder:
         self.chunk_frames = chunk_frames
         self._queue: queue.Queue[CirFrame | None] = queue.Queue(queue_size)
         self._thread = threading.Thread(target=self._run, name="mxs-recorder", daemon=False)
+        self._stop = threading.Event()
         self._error: BaseException | None = None
 
     def start(self) -> None:
@@ -224,23 +260,39 @@ class ChunkedCirRecorder:
     def append(self, frame: CirFrame, timeout: float = 1.0) -> None:
         if self._error is not None:
             raise self._error
+        if self._stop.is_set():
+            raise RuntimeError("recording worker is closing")
         self._queue.put(frame, timeout=timeout)
 
     def close(self, timeout: float = 5.0) -> None:
-        self._queue.put(None, timeout=timeout)
+        first_error = self._error
+        if first_error is not None:
+            self._stop.set()
+        if self._thread.is_alive() and first_error is None:
+            try:
+                self._queue.put(None, timeout=timeout)
+            except queue.Full as error:
+                first_error = error
+                self._stop.set()
         self._thread.join(timeout)
-        if self._thread.is_alive():
-            raise RuntimeError("recording worker failed to terminate")
-        if self._error is not None:
-            raise self._error
+        if self._thread.is_alive() and first_error is None:
+            first_error = RuntimeError("recording worker failed to terminate")
+        if first_error is None and self._error is not None:
+            first_error = self._error
+        self._stop.set()
+        if first_error is not None:
+            raise first_error
 
     def _run(self) -> None:
         chunk: list[CirFrame] = []
         index = 0
         try:
             with (self.directory / "metadata.jsonl").open("a", encoding="utf-8") as metadata:
-                while True:
-                    item = self._queue.get()
+                while not self._stop.is_set():
+                    try:
+                        item = self._queue.get(timeout=0.05)
+                    except queue.Empty:
+                        continue
                     if item is None:
                         if chunk:
                             self._flush_chunk(chunk, index, metadata)
@@ -253,6 +305,7 @@ class ChunkedCirRecorder:
                         index += 1
         except BaseException as error:
             self._error = error
+            self._stop.set()
 
     def _flush_chunk(self, chunk: list[CirFrame], index: int, metadata: TextIO) -> None:
         filename = f"chunk-{index:06d}.npy"
@@ -274,6 +327,7 @@ class ParsedMessageRecorder:
         self.directory = directory
         self._queue: queue.Queue[object | None] = queue.Queue(queue_size)
         self._thread = threading.Thread(target=self._run, name="mxs-message-writer", daemon=False)
+        self._stop = threading.Event()
         self._error: BaseException | None = None
         self.queue_high_water_mark = 0
 
@@ -285,6 +339,8 @@ class ParsedMessageRecorder:
     def append(self, message: object, timeout: float = 1.0) -> None:
         if self._error is not None:
             raise self._error
+        if self._stop.is_set():
+            raise RuntimeError("parsed-message recording worker is closing")
         try:
             self._queue.put(message, timeout=timeout)
             self.queue_high_water_mark = max(self.queue_high_water_mark, 1, self._queue.qsize())
@@ -294,12 +350,23 @@ class ParsedMessageRecorder:
             raise RecordingBackpressureError("parsed-message recording queue is full") from error
 
     def close(self, timeout: float = 5.0) -> None:
-        self._queue.put(None, timeout=timeout)
+        first_error = self._error
+        if first_error is not None:
+            self._stop.set()
+        if self._thread.is_alive() and first_error is None:
+            try:
+                self._queue.put(None, timeout=timeout)
+            except queue.Full as error:
+                first_error = error
+                self._stop.set()
         self._thread.join(timeout)
-        if self._thread.is_alive():
-            raise RuntimeError("parsed-message recording worker failed to terminate")
-        if self._error is not None:
-            raise self._error
+        if self._thread.is_alive() and first_error is None:
+            first_error = RuntimeError("parsed-message recording worker failed to terminate")
+        if first_error is None and self._error is not None:
+            first_error = self._error
+        self._stop.set()
+        if first_error is not None:
+            raise first_error
 
     def __enter__(self) -> ParsedMessageRecorder:
         self.start()
@@ -321,8 +388,11 @@ class ParsedMessageRecorder:
                     target.flush()
                     existing = 1
                 index = existing - 1
-                while True:
-                    message = self._queue.get()
+                while not self._stop.is_set():
+                    try:
+                        message = self._queue.get(timeout=0.05)
+                    except queue.Empty:
+                        continue
                     if message is None:
                         return
                     record = {
@@ -336,6 +406,7 @@ class ParsedMessageRecorder:
                     index += 1
         except BaseException as error:
             self._error = error
+            self._stop.set()
 
     def _encode(self, value: object, index: int, name: str) -> object:
         if isinstance(value, np.ndarray):

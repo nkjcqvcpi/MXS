@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.2 - validation pending
+
+- Isolated every baud probe in a fresh command manager, router, subscription set, and serial worker.
+- Made synchronous and asynchronous shutdown preserve the first error while still closing routers, workers, bridges, files, and consumer queues.
+- Removed recorder shutdown deadlocks and restored the legacy raw callback's RX-only contract while retaining direction-aware wire recording.
+- Required a confirmed firmware STOP state before destructive operations, except documented MANUAL-safe frame injection and register writes.
+- Serialized complete filesystem reads and mutations under one session lock.
+- Prevented cancelled asyncio waiters from entering a blocking queue path on the event-loop thread.
+- Corrected the complete Legacy-SW profile-ID set and retained `SLEEP` as its distinct `0x00F17B17` identifier.
+
 ## 0.2.1 - validation pending
 
 - Removed the legacy package and command namespace; MXS is now the sole package, CLI, documentation name, test namespace, and environment-variable prefix.

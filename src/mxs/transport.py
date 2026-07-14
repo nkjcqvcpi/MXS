@@ -211,7 +211,7 @@ class SerialWorker:
         self.decoder_worker = DecoderWorker(router, statistics)
 
         def dispatch_raw(chunk: WireChunk) -> None:
-            if self.raw_chunk_callback is not None:
+            if chunk.direction == "rx" and self.raw_chunk_callback is not None:
                 self.raw_chunk_callback(chunk.data)
             if self.wire_chunk_callback is not None:
                 self.wire_chunk_callback(chunk)
@@ -262,13 +262,24 @@ class SerialWorker:
         self.baudrate = baudrate
 
     def close(self, timeout: float = 3.0) -> None:
+        first_error: BaseException | None = None
         self._stop.set()
         self._thread.join(timeout)
         if self._thread.is_alive():
-            raise WorkerTerminatedError("serial worker failed to terminate")
-        self.decoder_worker.close(timeout)
+            first_error = WorkerTerminatedError("serial worker failed to terminate")
+        try:
+            self.decoder_worker.close(timeout)
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
         if self.raw_worker is not None:
-            self.raw_worker.close(timeout)
+            try:
+                self.raw_worker.close(timeout)
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
 
     def _open_serial(self) -> SerialLike:
         if self.serial_factory is not None:

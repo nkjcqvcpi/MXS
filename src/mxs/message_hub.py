@@ -42,12 +42,12 @@ class Subscription[T]:
                 if not candidate[1].done():
                     waiter = candidate
             if waiter is None:
-                self._enqueue_locked(message)
+                self._enqueue_locked(message, allow_block=True)
                 return
         loop, future = waiter
         loop.call_soon_threadsafe(self._complete_waiter, future, message)
 
-    def _enqueue_locked(self, message: T) -> None:
+    def _enqueue_locked(self, message: T, *, allow_block: bool) -> None:
         if len(self._queue) < self._capacity:
             self._queue.append(message)
             self._available.notify()
@@ -60,6 +60,12 @@ class Subscription[T]:
             self.dropped += 1
             return
         if self.overflow_policy == "block_with_timeout":
+            if not allow_block:
+                error = MessageQueueOverflowError(
+                    "typed message subscription cannot block the event loop"
+                )
+                self._fail_locked(error)
+                raise error
             deadline = time.monotonic() + self.block_timeout
             while len(self._queue) >= self._capacity and not self.closed:
                 remaining = deadline - time.monotonic()
@@ -79,10 +85,23 @@ class Subscription[T]:
         self._available.notify()
 
     def _complete_waiter(self, future: asyncio.Future[T], message: T) -> None:
-        if future.done():
-            self.publish(message)
-        else:
+        if not future.done():
             future.set_result(message)
+            return
+        waiter: tuple[asyncio.AbstractEventLoop, asyncio.Future[T]] | None = None
+        with self._lock:
+            while self._async_waiters and waiter is None:
+                candidate = self._async_waiters.pop(0)
+                if not candidate[1].done():
+                    waiter = candidate
+            if waiter is None:
+                try:
+                    self._enqueue_locked(message, allow_block=False)
+                except MessageQueueOverflowError:
+                    return
+        if waiter is not None:
+            loop, next_future = waiter
+            loop.call_soon_threadsafe(self._complete_waiter, next_future, message)
 
     def peek(self) -> T | None:
         with self._lock:
@@ -129,7 +148,7 @@ class Subscription[T]:
             return await asyncio.wait_for(future, timeout)
         except asyncio.CancelledError:
             if future.done() and not future.cancelled():
-                self.publish(future.result())
+                self._complete_waiter(future, future.result())
             raise
         finally:
             with self._lock:

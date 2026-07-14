@@ -59,7 +59,11 @@ class SystemInfoCode(IntEnum):
 
 class ProfileId(IntEnum):
     RESPIRATION = 0x1423A2D6
-    SLEEP = 0x064E57AD
+    SLEEP = 0x00F17B17
+    RESPIRATION_2 = 0x064E57AD
+    RESPIRATION_3 = 0x47FABEBA
+    RESPIRATION_4 = 0x4AC5D074
+    RESPIRATION_5 = 0xA9E03260
 
 
 class OutputFeature(IntEnum):

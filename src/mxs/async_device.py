@@ -135,14 +135,26 @@ class AsyncX4M200:
 
     async def close(self) -> None:
         self._bridge_stop.set()
-        await asyncio.to_thread(self._session.close)
-        if self._bridge_thread is not None:
-            await asyncio.to_thread(self._bridge_thread.join, 3.0)
-            if self._bridge_thread.is_alive():
-                raise RuntimeError("async bridge failed to terminate")
-        self._bridge_thread = None
-        self._async_frames = None
-        self._loop = None
+        first_error: BaseException | None = None
+        bridge = self._bridge_thread
+        try:
+            await asyncio.to_thread(self._session.close)
+        except BaseException as error:
+            first_error = error
+        try:
+            if bridge is not None:
+                await asyncio.to_thread(bridge.join, 3.0)
+                if bridge.is_alive():
+                    raise RuntimeError("async bridge failed to terminate")
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+        finally:
+            self._bridge_thread = None
+            self._async_frames = None
+            self._loop = None
+        if first_error is not None:
+            raise first_error
 
     def _bridge_frames(self) -> None:
         loop = self._loop

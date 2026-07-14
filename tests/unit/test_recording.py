@@ -1,4 +1,6 @@
 import io
+import time
+from collections.abc import Buffer
 from pathlib import Path
 from typing import cast
 
@@ -43,6 +45,7 @@ def test_wire_round_trip_and_truncation(tmp_path: Path) -> None:
     assert recorder.bytes_written == 13
     assert recorder.backlog == 0
     path.write_bytes(path.read_bytes()[:-1])
+    assert len(list(replay_wire_records(path, recover_truncated=True))) == 3
     try:
         list(replay_wire(path))
     except ValueError as error:
@@ -87,6 +90,68 @@ def test_wire_backpressure_is_fatal(tmp_path: Path) -> None:
     assert isinstance(failures[0], RecordingBackpressureError)
     with pytest.raises(RecordingBackpressureError):
         recorder.write_chunk(b"third", timeout=0)
+
+
+class FailingBinaryFile(io.BytesIO):
+    def __init__(self, error: BaseException) -> None:
+        super().__init__()
+        self.error = error
+        self.was_closed = False
+
+    def write(self, data: Buffer) -> int:
+        raise self.error
+
+    def close(self) -> None:
+        self.was_closed = True
+        super().close()
+
+
+def test_wire_writer_failure_with_full_queue_closes_without_deadlock(tmp_path: Path) -> None:
+    writer_error = OSError("injected writer failure")
+    failures: list[BaseException] = []
+    recorder = WireRecorder(
+        tmp_path / "writer-failure.mcpbin",
+        "fake",
+        115200,
+        fatal_callback=failures.append,
+        queue_capacity=1,
+    )
+    recorder.__enter__()
+    assert recorder._file is not None
+    recorder._file.close()
+    target = FailingBinaryFile(writer_error)
+    recorder._file = target
+    recorder.write_chunk(b"trigger")
+    deadline = time.monotonic() + 1
+    while recorder._error is None and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert recorder._error is writer_error
+    recorder._queue.put_nowait(WireChunk(time.monotonic_ns(), "rx", b"queued"))
+    started = time.monotonic()
+    with pytest.raises(OSError) as captured:
+        recorder.__exit__(None, None, None)
+    assert time.monotonic() - started < 1
+    assert captured.value is writer_error
+    assert failures == [writer_error]
+    assert target.was_closed
+    with pytest.raises(RuntimeError, match="not open"):
+        recorder.write_chunk(b"after-close")
+
+
+def test_wire_writer_failure_during_close_preserves_error_and_closes_file(
+    tmp_path: Path,
+) -> None:
+    writer_error = OSError("injected clean-marker failure")
+    recorder = WireRecorder(tmp_path / "close-failure.mcpbin", "fake", 115200)
+    recorder.__enter__()
+    assert recorder._file is not None
+    recorder._file.close()
+    target = FailingBinaryFile(writer_error)
+    recorder._file = target
+    with pytest.raises(OSError) as captured:
+        recorder.__exit__(None, None, None)
+    assert captured.value is writer_error
+    assert target.was_closed
 
 
 def test_npz_and_chunked_recording(tmp_path: Path) -> None:
