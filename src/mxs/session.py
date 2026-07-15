@@ -165,7 +165,7 @@ class DeviceSession:
             )
         self.worker = None
         self.state = DeviceState.CLOSED
-        return None
+        return cleanup_error
 
     def configure(self, config: X4Config) -> None:
         with self.operation_lock:

@@ -71,6 +71,8 @@ Unsafe namespaces require operation-specific environment gates and verify the de
 
 Any command timeout marks the session desynchronized, closes the transport, and rejects further commands. Call `recover()` to reprobe and restore STOP state. A disconnect wakes pending consumers; close and reopen the same object to rebuild workers and subscriptions.
 
+All structured interface commands acquire one reentrant session operation lock. Mutually exclusive IQ/amplitude-phase, pulse-Doppler float/byte, and noisemap float/byte enables are checked against freshly queried firmware state before the requested enable is transmitted.
+
 Firmware-dependent behavior is conservative. Unknown support is never reported as supported, and functions with no local producer or a negative probe raise `UnsupportedFirmwareError`. The tested firmware matrix is in [firmware capabilities](docs/firmware-capabilities.md).
 
 Extended respiration, periodic noisemap storage, the undocumented XEP normalization, phase-noise, decimation, number-format and legacy-output controls, and X4Driver I2C access are explicitly unsupported. Their public methods reject the call before transmitting bytes.
@@ -81,10 +83,10 @@ Extended respiration, periodic noisemap storage, the undocumented XEP normalizat
 uv run ruff format .
 uv run ruff check .
 uv run pyright
-MXS_TEST_PORT=/dev/tty.usbmodem2101 uv run pytest -x
+MXS_TEST_PORT=/dev/tty.usbmodem2101 uv run pytest -x --cov=mxs --cov-fail-under=90
 uv build
 ```
 
 Pytest requires the real X4M200 at the fixed path. Collection aborts if a test does not depend on the device fixture, and setup aborts if the port is missing, occupied, unidentified, or unresponsive. The suite contains no fake serial device, synthetic firmware response, checked-in traffic capture, or soak test.
 
-Protocol provenance is recorded in [source map](docs/source-map.md), [protocol notes](docs/protocol-notes.md), and [upstream sources](docs/upstream-sources.md). Release-specific changes are in [the 0.2.3 migration guide](docs/migration-0.2.2-to-0.2.3.md).
+Protocol provenance is recorded in [source map](docs/source-map.md), [protocol notes](docs/protocol-notes.md), and [upstream sources](docs/upstream-sources.md). Release-specific changes are in [the 0.2.4 migration guide](docs/migration-0.2.3-to-0.2.4.md).

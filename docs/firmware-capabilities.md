@@ -24,3 +24,7 @@ The sources declare extended-respiration feature ID `0x2375A16B` but define no c
 Periodic noisemap storage, XEP normalization/phase-noise/decimation/number-format/legacy-output controls, and X4Driver I2C access appear in public host headers but have no command producer in the checked-in target source. They raise `UnsupportedFirmwareError` rather than emitting guessed bytes.
 
 The 2026-07-15 device suite observed sleep, respiration, and baseband-IQ messages from `ProfileId.RESPIRATION_2`. Baseband IQ and amplitude/phase state was queried from the device before and after changes because those outputs are mutually exclusive. Capability booleans for extended respiration and periodic noisemap storage are therefore `False`, not unknown.
+
+Annapurna 1.6.6 returns content ID zero for the tested application replies for sensitivity, center frequency, detection zone, detection-zone limits, LED control, GPIO control, and noisemap control. GPIO value replies retain content ID `0x21`. MXS 0.2.4 validates these observed reply identifiers and retains strict datatype and element-count checks.
+
+The firmware permits only one enabled member in each observed output pair: baseband IQ versus amplitude/phase, pulse-Doppler float versus byte, and noisemap float versus byte. MXS 0.2.4 queries both members before every enable and raises before transmitting when the peer is active.

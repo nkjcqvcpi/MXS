@@ -181,7 +181,9 @@ def _capture(args: argparse.Namespace) -> int:
     return 0
 
 
-def _stream(args: argparse.Namespace) -> int:
+def _stream(  # pragma: no cover - intentionally unbounded interactive command
+    args: argparse.Namespace,
+) -> int:
     config = X4Config(downconversion=args.mode == "iq", fps=args.fps)
     with X4M200(
         port=args.port,

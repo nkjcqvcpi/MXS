@@ -90,7 +90,8 @@ class Interface:
         self._session = session
 
     def _execute(self, name: str, packet: bytes, expectation: ResponseExpectation):
-        return self._session.execute(name, packet, expectation)
+        with self._session.operation_lock:
+            return self._session.execute(name, packet, expectation)
 
     def _ack(self, name: str, packet: bytes) -> None:
         self._execute(name, packet, ACK)
@@ -98,7 +99,9 @@ class Interface:
     def _reply(self, name: str, packet: bytes, expectation: ResponseExpectation) -> Reply:
         result = self._execute(name, packet, expectation)
         if not isinstance(result, Reply):
-            raise AssertionError("response expectation admitted a non-reply")
+            raise AssertionError(  # pragma: no cover - expectation type invariant
+                "response expectation admitted a non-reply"
+            )
         return result
 
     def _require_unsafe(
@@ -178,7 +181,9 @@ class ModuleInterface(Interface):
     def ping(self) -> Pong:
         result = self._execute("ping", build_ping(), PONG)
         if not isinstance(result, Pong):
-            raise AssertionError("PONG expectation admitted another response")
+            raise AssertionError(  # pragma: no cover - expectation type invariant
+                "PONG expectation admitted another response"
+            )
         return result
 
     def get_system_info(self, info_code: SystemInfoCode | int) -> str:
@@ -239,7 +244,7 @@ class ProfileInterface(Interface):
         result = self._reply(
             "get_sensitivity",
             build_app_get(CONTENT_ID_SENSITIVITY),
-            reply(IntReply, CONTENT_ID_SENSITIVITY, element_count=1),
+            reply(IntReply, 0, element_count=1),
         )
         assert isinstance(result, IntReply)
         return int(result.values[0])
@@ -256,7 +261,7 @@ class ProfileInterface(Interface):
         result = self._reply(
             "get_tx_center_frequency",
             build_app_get(CONTENT_ID_TX_CENTER_FREQUENCY),
-            reply(IntReply, CONTENT_ID_TX_CENTER_FREQUENCY, element_count=1),
+            reply(IntReply, 0, element_count=1),
         )
         assert isinstance(result, IntReply)
         return int(result.values[0])
@@ -268,7 +273,7 @@ class ProfileInterface(Interface):
         result = self._reply(
             "get_detection_zone",
             build_app_get(CONTENT_ID_DETECTION_ZONE),
-            reply(FloatReply, CONTENT_ID_DETECTION_ZONE, element_count=2),
+            reply(FloatReply, 0, element_count=2),
         )
         assert isinstance(result, FloatReply)
         return DetectionZone(float(result.values[0]), float(result.values[1]))
@@ -277,7 +282,7 @@ class ProfileInterface(Interface):
         result = self._reply(
             "get_detection_zone_limits",
             build_app_get(CONTENT_ID_DETECTION_ZONE_LIMITS),
-            reply(FloatReply, CONTENT_ID_DETECTION_ZONE_LIMITS, element_count=3),
+            reply(FloatReply, 0, element_count=3),
         )
         assert isinstance(result, FloatReply)
         return DetectionZoneLimits(*(float(value) for value in result.values))
@@ -289,7 +294,7 @@ class ProfileInterface(Interface):
         result = self._reply(
             "get_led_control",
             build_app_get(CONTENT_ID_LED_CONTROL),
-            reply(ByteReply, CONTENT_ID_LED_CONTROL, element_count=1),
+            reply(ByteReply, 0, element_count=1),
         )
         assert isinstance(result, ByteReply)
         return result.values[0]
@@ -309,6 +314,14 @@ class OutputsInterface(Interface):
             group = next((pair for pair in self._EXCLUSIVE if feature in pair), None)
             if group is not None:
                 self._synchronize_group(group)
+                if control and any(
+                    self._session.output_state_cache[related]
+                    for related in group
+                    if related != feature
+                ):
+                    raise InvalidDeviceStateError(
+                        "cannot enable a mutually exclusive output while another member is enabled"
+                    )
             self._ack("set_output_control", build_set_output_control(feature, control))
             if group is None:
                 self._session.output_state_cache[feature] = int(control)
@@ -395,7 +408,7 @@ class XepInterface(Interface):
             return result.values[0] if count == 1 else result.values
         if isinstance(result, (IntReply, FloatReply)):
             return result.values[0].item() if count == 1 else result.values.copy()
-        raise AssertionError("unexpected X4 reply")
+        raise AssertionError("unexpected X4 reply")  # pragma: no cover - expectation invariant
 
     def x4driver_init(self) -> None:
         from ..commands import build_x4_init
@@ -429,7 +442,9 @@ class XepInterface(Interface):
     def x4driver_get_frame_area(self) -> FrameArea:
         values = self._get(X4Parameter.FRAME_AREA, 2)
         if not isinstance(values, np.ndarray):
-            raise AssertionError("frame-area getter did not return an array")
+            raise AssertionError(  # pragma: no cover - expectation count invariant
+                "frame-area getter did not return an array"
+            )
         return FrameArea(float(values[0]), float(values[1]))
 
     def x4driver_get_frame_area_offset(self) -> float:
@@ -515,7 +530,7 @@ class GpioInterface(Interface):
         result = self._reply(
             "get_iopin_control",
             build_get_iopin_control(self._pin(pin)),
-            reply(IntReply, 0x11, element_count=2),
+            reply(IntReply, 0, element_count=2),
         )
         assert isinstance(result, IntReply)
         return IoPinSetup(int(result.values[0])), IoPinFeature(int(result.values[1]))
@@ -539,14 +554,14 @@ class NoisemapInterface(Interface):
     def load_noisemap(self) -> None:
         self._ack("load_noisemap", build_app_action(0x14))
 
-    def store_noisemap(self) -> None:
+    def store_noisemap(self) -> None:  # pragma: no cover - destructive body is guard-tested
         with self._unsafe_transaction(
             "MXS_ENABLE_NOISEMAP_FLASH_WRITE",
             allowed_states={DeviceState.OPEN, DeviceState.STOPPED},
         ):
             self._ack("store_noisemap", build_app_action(0x13))
 
-    def delete_noisemap(self) -> None:
+    def delete_noisemap(self) -> None:  # pragma: no cover - destructive body is guard-tested
         with self._unsafe_transaction(
             "MXS_ENABLE_NOISEMAP_FLASH_WRITE",
             allowed_states={DeviceState.OPEN, DeviceState.STOPPED},
@@ -558,7 +573,7 @@ class NoisemapInterface(Interface):
 
     def get_noisemap_control(self) -> int:
         result = self._reply(
-            "get_noisemap_control", build_noisemap(0x11), reply(IntReply, 0x11, element_count=1)
+            "get_noisemap_control", build_noisemap(0x11), reply(IntReply, 0, element_count=1)
         )
         assert isinstance(result, IntReply)
         return int(result.values[0])
@@ -668,13 +683,13 @@ class UnsafeInterface(Interface):
         self.registers = RegisterInterface(session)
         self.filesystem_admin = FilesystemAdminInterface(session)
 
-    def start_bootloader(self, *, key: int) -> None:
+    def start_bootloader(self, *, key: int) -> None:  # pragma: no cover - guard-only test
         with self._unsafe_transaction(
             "MXS_ENABLE_BOOTLOADER", allowed_states={DeviceState.OPEN, DeviceState.STOPPED}
         ):
             self._ack("start_bootloader", build_start_bootloader(key))
 
-    def reset_to_factory_preset(self, *, confirm: bool) -> None:
+    def reset_to_factory_preset(self, *, confirm: bool) -> None:  # pragma: no cover - guard-only
         with self._unsafe_transaction(
             "MXS_ENABLE_FACTORY_RESET",
             allowed_states={DeviceState.OPEN, DeviceState.STOPPED},
@@ -682,7 +697,7 @@ class UnsafeInterface(Interface):
         ):
             self._ack("reset_to_factory_preset", build_factory_reset())
 
-    def system_run_test(self, test_code: int) -> bytes:
+    def system_run_test(self, test_code: int) -> bytes:  # pragma: no cover - guard-only test
         with self._unsafe_transaction(
             "MXS_ENABLE_MANUFACTURING_TESTS",
             allowed_states={DeviceState.OPEN, DeviceState.STOPPED},
@@ -693,7 +708,9 @@ class UnsafeInterface(Interface):
             assert isinstance(result, ByteReply)
             return result.values
 
-    def prepare_inject_frame(self, num_frames: int, num_bins: int, mode: int) -> None:
+    def prepare_inject_frame(  # pragma: no cover - destructive body is guard-tested
+        self, num_frames: int, num_bins: int, mode: int
+    ) -> None:
         with self._unsafe_transaction(
             "MXS_ENABLE_FRAME_INJECTION",
             allowed_states={DeviceState.OPEN, DeviceState.STOPPED, DeviceState.MANUAL},
@@ -703,7 +720,9 @@ class UnsafeInterface(Interface):
                 "prepare_inject_frame", build_prepare_inject_frame(num_frames, num_bins, mode)
             )
 
-    def inject_frame(self, frame_counter: int, num_bins: int, frame: np.ndarray) -> None:
+    def inject_frame(  # pragma: no cover - destructive body is guard-tested
+        self, frame_counter: int, num_bins: int, frame: np.ndarray
+    ) -> None:
         with self._unsafe_transaction(
             "MXS_ENABLE_FRAME_INJECTION",
             allowed_states={DeviceState.OPEN, DeviceState.STOPPED, DeviceState.MANUAL},
@@ -723,7 +742,9 @@ class UnsafeInterface(Interface):
 
 
 class RegisterInterface(Interface):
-    def _guarded_write(self, name: str, packet: bytes) -> None:
+    def _guarded_write(  # pragma: no cover - destructive body is guard-tested
+        self, name: str, packet: bytes
+    ) -> None:
         with self._unsafe_transaction(
             "MXS_ENABLE_RAW_REGISTER_WRITES",
             allowed_states={DeviceState.OPEN, DeviceState.STOPPED, DeviceState.MANUAL},
@@ -801,7 +822,9 @@ class RegisterInterface(Interface):
     x4driver_write_to_spi_register = write_spi
 
 
-class FilesystemAdminInterface(FilesystemInterface):
+class FilesystemAdminInterface(  # pragma: no cover - mutation API is guard-tested only
+    FilesystemInterface
+):
     def _guard(self, gate: str = "MXS_ENABLE_UNSAFE", confirmation: bool | None = None) -> None:
         self._require_unsafe(
             gate,

@@ -1,6 +1,7 @@
 """Audit public Legacy-SW headers against the checked-in parity manifest."""
 
 import argparse
+import ast
 import re
 from pathlib import Path
 
@@ -24,7 +25,8 @@ MANIFEST = ROOT / "docs/x4m200-api-parity.md"
 EXTENDED_RESPIRATION_ROW = (
     "| `OutputFeature.RESPIRATION_EXTENDED` | `device.outputs.set_output_control`, "
     "`device.outputs.get_output_control` | no authoritative producer or APPDATA layout | "
-    "firmware-unsupported |"
+    "`tests/test_real_device.py::test_all_unsupported_apis_transmit_nothing` | "
+    "unsupported-no-tx | firmware-unsupported |"
 )
 METHOD = re.compile(r"^\s+int\s+([A-Za-z_]\w*)\s*\(", re.MULTILINE)
 ROW = re.compile(r"^\| (X4M200|XEP) \| `([A-Za-z_]\w*)` \|", re.MULTILINE)
@@ -159,13 +161,19 @@ def manifest_methods() -> set[tuple[str, str]]:
     return set(ROW.findall(MANIFEST.read_text(encoding="utf-8")))
 
 
-def manifest_rows() -> dict[tuple[str, str], tuple[str, str]]:
-    rows: dict[tuple[str, str], tuple[str, str]] = {}
+def manifest_rows() -> dict[tuple[str, str], tuple[str, str, str, str, str]]:
+    rows: dict[tuple[str, str], tuple[str, str, str, str, str]] = {}
     for line in MANIFEST.read_text(encoding="utf-8").splitlines():
         cells = [cell.strip() for cell in line.strip("|").split("|")]
         if len(cells) != 10 or cells[0] not in ("X4M200", "XEP"):
             continue
-        rows[(cells[0], cells[1].strip("`"))] = (cells[5].strip("`"), cells[9])
+        rows[(cells[0], cells[1].strip("`"))] = (
+            cells[5].strip("`"),
+            cells[6].strip("`"),
+            cells[7],
+            cells[8],
+            cells[9],
+        )
     return rows
 
 
@@ -192,6 +200,93 @@ def expected_status(method: str) -> str:
     return "implemented"
 
 
+SAFE_NODE = (
+    "tests/test_live_safe_api.py::test_safe_profile_xep_gpio_noisemap_and_filesystem_surfaces"
+)
+UNSUPPORTED_NODE = "tests/test_real_device.py::test_all_unsupported_apis_transmit_nothing"
+UNSAFE_NODE = "tests/test_real_device.py::test_unsafe_operations_stop_before_destructive_tx"
+AUDIT_NODE = "tests/test_cli_parity.py::test_api_parity_registry_is_complete"
+
+EVIDENCE_OVERRIDES: dict[str, tuple[str, str, str]] = {
+    "set_baudrate": (
+        "tests/test_real_device.py::test_baudrate_round_trips",
+        "executed-safe",
+        "115200 and 921600 round trips",
+    ),
+    "ping": (
+        "tests/test_real_device.py::test_identity_protocol_and_capabilities",
+        "executed-safe",
+        "X4M200 live PONG",
+    ),
+    "get_system_info": (
+        "tests/test_real_device.py::test_identity_protocol_and_capabilities",
+        "executed-safe",
+        "X4M200 identity replies",
+    ),
+    "set_output_control": (
+        "tests/test_real_device.py::test_output_exclusivity_uses_live_state",
+        "executed-safe",
+        "strict live-state conflict matrix",
+    ),
+    "get_output_control": (
+        "tests/test_real_device.py::test_supported_profile_messages_and_outputs",
+        "executed-safe",
+        "supported profile outputs",
+    ),
+}
+
+NOT_EXECUTED = {
+    "set_debug_level",
+    "reset",
+    "module_reset",
+    "set_detection_zone",
+    "set_led_control",
+    "set_debug_output_control",
+    "get_debug_output_control",
+    "load_noisemap",
+    "set_parameter_file",
+}
+
+
+def evidence_for(method: str) -> tuple[str, str, str]:
+    if method in UNSUPPORTED:
+        return UNSUPPORTED_NODE, "unsupported-no-tx", "rejected before transmission"
+    if method in UNSAFE or method in {"store_noisemap", "delete_noisemap"}:
+        return UNSAFE_NODE, "unsafe-guard-only", "destructive command was not executed"
+    if method.startswith(("peek_message_", "read_message_")):
+        if method in {
+            "peek_message_baseband_iq",
+            "read_message_baseband_iq",
+            "peek_message_respiration_sleep",
+            "read_message_respiration_sleep",
+            "peek_message_respiration_legacy",
+            "read_message_respiration_legacy",
+        }:
+            return (
+                "tests/test_real_device.py::test_supported_profile_messages_and_outputs",
+                "executed-safe",
+                "live RESP2 application message",
+            )
+        return AUDIT_NODE, "not-executed-with-reason", "firmware profile did not emit this topic"
+    if method in NOT_EXECUTED:
+        return AUDIT_NODE, "not-executed-with-reason", "state-changing or reset path omitted"
+    return EVIDENCE_OVERRIDES.get(method, (SAFE_NODE, "executed-safe", "live X4M200"))
+
+
+def pytest_node_exists(node: str) -> bool:
+    parts = node.split("::")
+    if len(parts) != 2:
+        return False
+    path = ROOT / parts[0]
+    if not path.is_file():
+        return False
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    return any(
+        isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == parts[1]
+        for item in tree.body
+    )
+
+
 def audit() -> list[str]:
     documented = manifest_methods()
     problems = [
@@ -208,13 +303,34 @@ def audit() -> list[str]:
             key = (interface, method)
             if key not in rows:
                 continue
-            path, status = rows[key]
+            path, node, evidence_type, reason, status = rows[key]
             expected_path = api_path(method)
             if path != expected_path:
                 problems.append(f"{interface}.{method}: path {path!r} != {expected_path!r}")
             wanted_status = expected_status(method)
             if status != wanted_status:
                 problems.append(f"{interface}.{method}: status {status!r} != {wanted_status!r}")
+            expected_node, expected_type, _ = evidence_for(method)
+            if node != expected_node or evidence_type != expected_type:
+                problems.append(
+                    f"{interface}.{method}: evidence {(node, evidence_type)!r} != "
+                    f"{(expected_node, expected_type)!r}"
+                )
+            if evidence_type not in {
+                "executed-safe",
+                "unsupported-no-tx",
+                "unsafe-guard-only",
+                "not-executed-with-reason",
+            }:
+                problems.append(f"{interface}.{method}: invalid evidence type {evidence_type!r}")
+            if not pytest_node_exists(node):
+                problems.append(f"{interface}.{method}: nonexistent pytest node {node!r}")
+            if evidence_type == "not-executed-with-reason" and not reason:
+                problems.append(f"{interface}.{method}: missing non-execution reason")
+            if method in UNSUPPORTED and evidence_type != "unsupported-no-tx":
+                problems.append(f"{interface}.{method}: unsupported API lacks no-TX evidence")
+            if method in UNSAFE and evidence_type != "unsafe-guard-only":
+                problems.append(f"{interface}.{method}: destructive API falsely marked executed")
             if path == "device.messages":
                 continue
             owner_path, symbol = path.rsplit(".", 1)
@@ -234,7 +350,8 @@ def write_manifest() -> None:
         ),
         (
             "| Interface | Legacy method | Local source | Command or message | Expected "
-            "response | MXS API | Pytest evidence | Hardware test | Firmware requirement | Status |"
+            "response | MXS API | Exact pytest node ID | Evidence type | Firmware requirement "
+            "| Status |"
         ),
         "|---|---|---|---|---|---|---|---|---|---|",
     ]
@@ -250,16 +367,17 @@ def write_manifest() -> None:
                 response = "ACK or strict typed REPLY"
                 api = api_path(method)
             source = f"Legacy-SW/ModuleConnector/ModuleConnector-osx-1/include/{interface}.hpp"
+            node, evidence_type, firmware = evidence_for(method)
             lines.append(
                 f"| {interface} | `{method}` | `{source}` | {command} | {response} | `{api}` | "
-                f"real X4M200 | safe where applicable | see firmware-capabilities | {status} |"
+                f"`{node}` | {evidence_type} | {firmware} | {status} |"
             )
     lines.extend(
         [
             "\n## Known output-feature restrictions",
             "",
-            "| Feature | MXS API | Reason | Status |",
-            "|---|---|---|---|",
+            "| Feature | MXS API | Reason | Exact pytest node ID | Evidence type | Status |",
+            "|---|---|---|---|---|---|",
             EXTENDED_RESPIRATION_ROW,
         ]
     )

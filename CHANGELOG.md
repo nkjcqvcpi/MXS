@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.4 - 2026-07-15
+
+- Serialize every structured interface command through the session operation lock, including complete filesystem and output-state transactions.
+- Preserve baud-candidate cleanup failures after worker termination and abort automatic detection on callback, recorder, decoder, or shutdown errors.
+- Reject mutually exclusive output enables from fresh device queries before transmission, then resynchronize the complete group after ACK.
+- Restore the original profile and supported output states after stateful tests, force STOP at 115200 baud, and reject leaked MXS workers.
+- Restore deterministic protocol, concurrency, recording, processing, CLI, parity, and real-callback regressions under the mandatory hardware preflight.
+- Bind every API-parity row to an existing pytest node and an explicit executed, unsupported, unsafe, or non-executed evidence classification.
+
 ## 0.2.3 - 2026-07-15
 
 - Reject extended respiration, periodic noisemap storage, undocumented XEP controls, and X4Driver I2C access with `UnsupportedFirmwareError` before transmission.

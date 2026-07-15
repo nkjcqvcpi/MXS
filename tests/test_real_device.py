@@ -54,11 +54,12 @@ def test_identity_protocol_and_capabilities(device_port: str) -> None:
 
 
 @pytest.mark.hardware
+@pytest.mark.stateful
 def test_baudrate_round_trips(device_port: str) -> None:
     try:
         with X4M200(port=device_port, baudrate=115200) as device:
             assert device.module.ping().ready
-            device.module.set_baudrate(921600)
+            device.switch_to_high_baudrate()
             assert device.detected_baudrate == 921600
             assert device.module.ping().ready
         with X4M200(port=device_port, baudrate=921600) as device:
@@ -76,13 +77,16 @@ def test_baudrate_round_trips(device_port: str) -> None:
 
 
 @pytest.mark.hardware
+@pytest.mark.stateful
 @pytest.mark.parametrize(("downconversion", "dtype"), [(False, np.float32), (True, np.complex64)])
 def test_capture_100_frames(device_port: str, downconversion: bool, dtype: object) -> None:
     with X4M200(port=device_port, frame_queue_size=128) as device:
         device.configure(X4Config(downconversion=downconversion))
         try:
             device.start()
-            frames = [device.read_frame(timeout=2.0) for _ in range(100)]
+            stream = device.frames()
+            frames = [next(stream)]
+            frames.extend([device.read_frame(timeout=2.0) for _ in range(99)])
         finally:
             device.stop()
         assert all(frame.samples.dtype == dtype for frame in frames)
@@ -96,15 +100,27 @@ def test_capture_100_frames(device_port: str, downconversion: bool, dtype: objec
 
 
 @pytest.mark.hardware
+@pytest.mark.stateful
 @pytest.mark.asyncio
 @pytest.mark.timeout(45)
 async def test_async_capture_512_frames(device_port: str) -> None:
     device = AsyncX4M200(port=device_port, frame_queue_size=640)
+    unopened = AsyncX4M200(port=device_port)
+    with pytest.raises(RuntimeError, match="not open"):
+        await unopened.read_frame(timeout=0.001)
     try:
-        await device.open()
+        await device.__aenter__()
+        assert await device.module.ping() is not None
+        assert await device.profile.get_sensor_mode() is SensorMode.STOP
         await device.configure(X4Config(downconversion=True))
         await device.start()
-        frames = [await device.read_frame(timeout=2.0) for _ in range(512)]
+        cancelled = asyncio.create_task(device.read_frame(timeout=2.0))
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+        stream = device.frames()
+        frames = [await anext(stream)]
+        frames.extend([await device.read_frame(timeout=2.0) for _ in range(511)])
         await device.stop()
         statistics = await device.statistics()
         _assert_ordered_frames(frames)
@@ -113,12 +129,13 @@ async def test_async_capture_512_frames(device_port: str) -> None:
         assert statistics.consumer_drops == 0
         assert statistics.queue_overflows == 0
     finally:
-        await device.close()
+        await device.__aexit__(None, None, None)
     await asyncio.sleep(0)
     assert not any(thread.name.startswith("mxs-") for thread in threading.enumerate())
 
 
 @pytest.mark.hardware
+@pytest.mark.stateful
 def test_supported_profile_messages_and_outputs(device_port: str) -> None:
     with X4M200(port=device_port) as device:
         device.profile.set_sensor_mode(SensorMode.STOP)
@@ -144,6 +161,34 @@ def test_supported_profile_messages_and_outputs(device_port: str) -> None:
 
 
 @pytest.mark.hardware
+@pytest.mark.stateful
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        (OutputFeature.BASEBAND_IQ, OutputFeature.BASEBAND_AMPLITUDE_PHASE),
+        (OutputFeature.PULSE_DOPPLER_FLOAT, OutputFeature.PULSE_DOPPLER_BYTE),
+        (OutputFeature.NOISEMAP_FLOAT, OutputFeature.NOISEMAP_BYTE),
+    ],
+)
+def test_output_exclusivity_uses_live_state(
+    device_port: str, first: OutputFeature, second: OutputFeature
+) -> None:
+    with X4M200(port=device_port) as device:
+        device.profile.set_sensor_mode(SensorMode.STOP)
+        for feature in (first, second):
+            device.outputs.set_output_control(feature, OutputControl.DISABLE)
+        device.outputs.set_output_control(first, OutputControl.ENABLE)
+        assert device.outputs.get_output_control(first) & OutputControl.ENABLE
+        with pytest.raises(InvalidDeviceStateError, match="mutually exclusive"):
+            device.outputs.set_output_control(second, OutputControl.ENABLE)
+        assert device.outputs.get_output_control(second) == 0
+        device.outputs.set_output_control(first, OutputControl.DISABLE)
+        device.outputs.set_output_control(second, OutputControl.ENABLE)
+        assert device.outputs.get_output_control(second) & OutputControl.ENABLE
+
+
+@pytest.mark.hardware
+@pytest.mark.stateful
 def test_five_second_wire_recording_and_replay(device_port: str, tmp_path: Path) -> None:
     path = tmp_path / "live.mcpbin"
     raw_chunks: list[bytes] = []
@@ -171,6 +216,7 @@ def test_five_second_wire_recording_and_replay(device_port: str, tmp_path: Path)
 
 
 @pytest.mark.hardware
+@pytest.mark.stateful
 def test_five_reopen_cycles(device_port: str) -> None:
     for _ in range(5):
         with X4M200(port=device_port, baudrate=115200) as device:
@@ -213,6 +259,7 @@ def test_all_unsupported_apis_transmit_nothing(device_port: str) -> None:
 
 
 @pytest.mark.hardware
+@pytest.mark.stateful
 @pytest.mark.unsafe
 def test_unsafe_operations_stop_before_destructive_tx(
     device_port: str, monkeypatch: pytest.MonkeyPatch
