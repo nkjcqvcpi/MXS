@@ -2,7 +2,8 @@
 
 import os
 import struct
-from contextlib import suppress
+from collections.abc import Generator
+from contextlib import contextmanager, suppress
 from typing import ClassVar, Never
 
 import numpy as np
@@ -55,6 +56,7 @@ from ..constants import (
     CONTENT_ID_DETECTION_ZONE,
     CONTENT_ID_DETECTION_ZONE_LIMITS,
     CONTENT_ID_LED_CONTROL,
+    CONTENT_ID_RESPIRATION_EXTENDED,
     CONTENT_ID_SENSITIVITY,
     CONTENT_ID_TX_CENTER_FREQUENCY,
     DeviceState,
@@ -141,6 +143,24 @@ class Interface:
                 f"actual sensor mode is {sensor_mode.name}"
             )
 
+    @contextmanager
+    def _unsafe_transaction(
+        self,
+        gate: str,
+        *,
+        allowed_states: set[DeviceState],
+        confirmation: bool | None = None,
+        allow_manual: bool = False,
+    ) -> Generator[None]:
+        with self._session.operation_lock:
+            self._require_unsafe(
+                gate,
+                allowed_states=allowed_states,
+                confirmation=confirmation,
+                allow_manual=allow_manual,
+            )
+            yield
+
 
 class ModuleInterface(Interface):
     def set_debug_level(self, level: int) -> None:
@@ -172,20 +192,26 @@ class ModuleInterface(Interface):
         return result.value
 
     def module_reset(self) -> None:
-        self._ack("module_reset", build_module_reset())
+        with self._session.operation_lock:
+            self._ack("module_reset", build_module_reset())
+            self._session.invalidate_output_state()
 
     def reset(self) -> None:
-        self.module_reset()
-        self._session.close_passive()
-        self._session.open()
+        with self._session.operation_lock:
+            self.module_reset()
+            self._session.close_passive()
+            self._session.open()
 
 
 class ProfileInterface(Interface):
     def load_profile(self, profile_id: int) -> None:
-        self._ack("load_profile", build_load_profile(profile_id))
+        with self._session.operation_lock:
+            self._ack("load_profile", build_load_profile(profile_id))
+            self._session.invalidate_output_state()
 
     def set_sensor_mode(self, mode: SensorMode | int, param: int = 0) -> None:
-        self._ack("set_sensor_mode", build_set_sensor_mode(SensorMode(mode), param))
+        with self._session.operation_lock:
+            self._ack("set_sensor_mode", build_set_sensor_mode(SensorMode(mode), param))
 
     def get_sensor_mode(self) -> SensorMode:
         result = self._reply(
@@ -276,40 +302,66 @@ class OutputsInterface(Interface):
         frozenset((0x12, 0x13)),
     )
 
-    def __init__(self, session: DeviceSession) -> None:
-        super().__init__(session)
-        self._enabled: set[int] = set()
-
     def set_output_control(self, feature: int, control: int) -> None:
-        if control:
-            for pair in self._EXCLUSIVE:
-                if feature in pair and self._enabled.intersection(pair - {feature}):
-                    raise ValueError("mutually exclusive output is already enabled")
-        self._ack("set_output_control", build_set_output_control(feature, control))
-        (self._enabled.add if control else self._enabled.discard)(feature)
+        feature = int(feature)
+        self._require_supported_feature(feature)
+        with self._session.operation_lock:
+            group = next((pair for pair in self._EXCLUSIVE if feature in pair), None)
+            if group is not None:
+                self._synchronize_group(group)
+            self._ack("set_output_control", build_set_output_control(feature, control))
+            if group is None:
+                self._session.output_state_cache[feature] = int(control)
+            else:
+                self._synchronize_group(group)
 
     def get_output_control(self, feature: int) -> int:
+        feature = int(feature)
+        self._require_supported_feature(feature)
+        with self._session.operation_lock:
+            return self._get_output_control_locked(feature)
+
+    def _get_output_control_locked(self, feature: int) -> int:
         result = self._reply(
             "get_output_control",
             build_get_output_control(feature),
-            reply(IntReply, feature, element_count=1),
+            reply(IntReply, 0, element_count=1),
         )
         assert isinstance(result, IntReply)
-        return int(result.values[0])
+        value = int(result.values[0])
+        self._session.output_state_cache[feature] = value
+        return value
+
+    def _synchronize_group(self, group: frozenset[int]) -> None:
+        for related in group:
+            self._get_output_control_locked(related)
+
+    @staticmethod
+    def _require_supported_feature(feature: int) -> None:
+        if feature == CONTENT_ID_RESPIRATION_EXTENDED:
+            raise UnsupportedFirmwareError(
+                "extended respiration has no authoritative payload layout in local Legacy-SW"
+            )
 
     def set_debug_output_control(self, feature: int, control: int) -> None:
-        self._ack(
-            "set_debug_output_control", build_set_output_control(feature, control, debug=True)
-        )
+        feature = int(feature)
+        self._require_supported_feature(feature)
+        with self._session.operation_lock:
+            self._ack(
+                "set_debug_output_control", build_set_output_control(feature, control, debug=True)
+            )
 
     def get_debug_output_control(self, feature: int) -> int:
-        result = self._reply(
-            "get_debug_output_control",
-            build_get_output_control(feature, debug=True),
-            reply(IntReply, feature, element_count=1),
-        )
-        assert isinstance(result, IntReply)
-        return int(result.values[0])
+        feature = int(feature)
+        self._require_supported_feature(feature)
+        with self._session.operation_lock:
+            result = self._reply(
+                "get_debug_output_control",
+                build_get_output_control(feature, debug=True),
+                reply(IntReply, 0, element_count=1),
+            )
+            assert isinstance(result, IntReply)
+            return int(result.values[0])
 
 
 class XepInterface(Interface):
@@ -488,18 +540,18 @@ class NoisemapInterface(Interface):
         self._ack("load_noisemap", build_app_action(0x14))
 
     def store_noisemap(self) -> None:
-        self._require_unsafe(
+        with self._unsafe_transaction(
             "MXS_ENABLE_NOISEMAP_FLASH_WRITE",
             allowed_states={DeviceState.OPEN, DeviceState.STOPPED},
-        )
-        self._ack("store_noisemap", build_app_action(0x13))
+        ):
+            self._ack("store_noisemap", build_app_action(0x13))
 
     def delete_noisemap(self) -> None:
-        self._require_unsafe(
+        with self._unsafe_transaction(
             "MXS_ENABLE_NOISEMAP_FLASH_WRITE",
             allowed_states={DeviceState.OPEN, DeviceState.STOPPED},
-        )
-        self._ack("delete_noisemap", build_app_action(0x16))
+        ):
+            self._ack("delete_noisemap", build_app_action(0x16))
 
     def set_noisemap_control(self, control: int) -> None:
         self._ack("set_noisemap_control", build_noisemap(0x10, control))
@@ -617,49 +669,51 @@ class UnsafeInterface(Interface):
         self.filesystem_admin = FilesystemAdminInterface(session)
 
     def start_bootloader(self, *, key: int) -> None:
-        self._require_unsafe(
+        with self._unsafe_transaction(
             "MXS_ENABLE_BOOTLOADER", allowed_states={DeviceState.OPEN, DeviceState.STOPPED}
-        )
-        self._ack("start_bootloader", build_start_bootloader(key))
+        ):
+            self._ack("start_bootloader", build_start_bootloader(key))
 
     def reset_to_factory_preset(self, *, confirm: bool) -> None:
-        self._require_unsafe(
+        with self._unsafe_transaction(
             "MXS_ENABLE_FACTORY_RESET",
             allowed_states={DeviceState.OPEN, DeviceState.STOPPED},
             confirmation=confirm,
-        )
-        self._ack("reset_to_factory_preset", build_factory_reset())
+        ):
+            self._ack("reset_to_factory_preset", build_factory_reset())
 
     def system_run_test(self, test_code: int) -> bytes:
-        self._require_unsafe(
+        with self._unsafe_transaction(
             "MXS_ENABLE_MANUFACTURING_TESTS",
             allowed_states={DeviceState.OPEN, DeviceState.STOPPED},
-        )
-        result = self._reply(
-            "system_run_test", build_system_test(test_code), reply(ByteReply, 0x5090)
-        )
-        assert isinstance(result, ByteReply)
-        return result.values
+        ):
+            result = self._reply(
+                "system_run_test", build_system_test(test_code), reply(ByteReply, 0x5090)
+            )
+            assert isinstance(result, ByteReply)
+            return result.values
 
     def prepare_inject_frame(self, num_frames: int, num_bins: int, mode: int) -> None:
-        self._require_unsafe(
+        with self._unsafe_transaction(
             "MXS_ENABLE_FRAME_INJECTION",
             allowed_states={DeviceState.OPEN, DeviceState.STOPPED, DeviceState.MANUAL},
             allow_manual=True,
-        )
-        self._ack("prepare_inject_frame", build_prepare_inject_frame(num_frames, num_bins, mode))
+        ):
+            self._ack(
+                "prepare_inject_frame", build_prepare_inject_frame(num_frames, num_bins, mode)
+            )
 
     def inject_frame(self, frame_counter: int, num_bins: int, frame: np.ndarray) -> None:
-        self._require_unsafe(
+        with self._unsafe_transaction(
             "MXS_ENABLE_FRAME_INJECTION",
             allowed_states={DeviceState.OPEN, DeviceState.STOPPED, DeviceState.MANUAL},
             allow_manual=True,
-        )
-        values = np.asarray(frame, dtype="<f4")
-        self._ack(
-            "inject_frame",
-            build_inject_frame(frame_counter, num_bins, values.tobytes(order="C")),
-        )
+        ):
+            values = np.asarray(frame, dtype="<f4")
+            self._ack(
+                "inject_frame",
+                build_inject_frame(frame_counter, num_bins, values.tobytes(order="C")),
+            )
 
     def __getattr__(self, name: str):
         for interface in (self.registers, self.filesystem_admin):
@@ -669,12 +723,13 @@ class UnsafeInterface(Interface):
 
 
 class RegisterInterface(Interface):
-    def _guard_write(self) -> None:
-        self._require_unsafe(
+    def _guarded_write(self, name: str, packet: bytes) -> None:
+        with self._unsafe_transaction(
             "MXS_ENABLE_RAW_REGISTER_WRITES",
             allowed_states={DeviceState.OPEN, DeviceState.STOPPED, DeviceState.MANUAL},
             allow_manual=True,
-        )
+        ):
+            self._ack(name, packet)
 
     def x4driver_get_spi_register(self, address: int) -> int:
         result = self._reply(
@@ -686,22 +741,19 @@ class RegisterInterface(Interface):
         return result.values[0]
 
     def x4driver_set_spi_register(self, address: int, value: int) -> None:
-        self._guard_write()
-        self._ack(
+        self._guarded_write(
             "x4driver_set_spi_register",
             build_x4_set_register(X4Parameter.SPI_REGISTER, address, value),
         )
 
     def x4driver_set_pif_register(self, address: int, value: int) -> None:
-        self._guard_write()
-        self._ack(
+        self._guarded_write(
             "x4driver_set_pif_register",
             build_x4_set_register(X4Parameter.PIF_REGISTER, address, value),
         )
 
     def x4driver_set_xif_register(self, address: int, value: int) -> None:
-        self._guard_write()
-        self._ack(
+        self._guarded_write(
             "x4driver_set_xif_register",
             build_x4_set_register(X4Parameter.XIF_REGISTER, address, value),
         )
@@ -741,8 +793,9 @@ class RegisterInterface(Interface):
         return result.values
 
     def write_spi(self, address: int, values: bytes) -> None:
-        self._guard_write()
-        self._ack("write_spi", build_x4_write(X4Parameter.SPI_REGISTER, bytes((address,)) + values))
+        self._guarded_write(
+            "write_spi", build_x4_write(X4Parameter.SPI_REGISTER, bytes((address,)) + values)
+        )
 
     x4driver_read_from_spi_register = read_spi
     x4driver_write_to_spi_register = write_spi

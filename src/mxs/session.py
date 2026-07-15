@@ -29,7 +29,7 @@ from .errors import BaudDetectionError, InvalidDeviceStateError, WorkerTerminate
 from .expectations import ResponseExpectation
 from .models import Ack, CirFrame, Pong, Reply, SessionStatistics, X4Config
 from .router import CommandManager, FrameSubscription, MessageRouter, QueuePolicy
-from .transport import SerialFactory, SerialWorker, WireChunk
+from .transport import SerialWorker, WireChunk
 
 LOGGER = logging.getLogger(__name__)
 
@@ -43,7 +43,6 @@ class DeviceSession:
         frame_queue_size: int = 256,
         overflow_policy: QueuePolicy = "error",
         command_timeout: float = 2.0,
-        serial_factory: SerialFactory | None = None,
         raw_chunk_callback: Callable[[bytes], None] | None = None,
         wire_chunk_callback: Callable[[WireChunk], None] | None = None,
     ) -> None:
@@ -53,7 +52,6 @@ class DeviceSession:
         self.requested_baudrate = baudrate
         self.detected_baudrate: int | None = None
         self.command_timeout = command_timeout
-        self.serial_factory = serial_factory
         self.raw_chunk_callback = raw_chunk_callback
         self.wire_chunk_callback = wire_chunk_callback
         self.state = DeviceState.CLOSED
@@ -62,7 +60,9 @@ class DeviceSession:
         self._frame_queue_size: int = frame_queue_size
         self._overflow_policy: QueuePolicy = overflow_policy
         self._reprobe_all_baudrates = False
-        self.filesystem_lock = threading.RLock()
+        self.operation_lock = threading.RLock()
+        self.filesystem_lock = self.operation_lock
+        self.output_state_cache: dict[int, int] = {}
         self.command_manager: CommandManager
         self.router: MessageRouter
         self.frames: FrameSubscription
@@ -92,7 +92,12 @@ class DeviceSession:
         self.frames = self.router.subscribe(self._frame_queue_size, self._overflow_policy)
 
     def open(self) -> None:
+        with self.operation_lock:
+            self._open_locked()
+
+    def _open_locked(self) -> None:
         self._require(DeviceState.CLOSED)
+        self.invalidate_output_state()
         candidates = (
             (115200, 921600)
             if self.requested_baudrate == "auto" or self._reprobe_all_baudrates
@@ -114,7 +119,9 @@ class DeviceSession:
                 return
             except BaseException as error:
                 failures.append(f"{baudrate}: {error}")
-                self._close_candidate(worker)
+                cleanup_error = self._close_candidate(worker)
+                if cleanup_error is not None:
+                    raise cleanup_error from error
         raise BaudDetectionError("; ".join(failures))
 
     def _create_worker(self, baudrate: int) -> SerialWorker:
@@ -123,7 +130,6 @@ class DeviceSession:
             baudrate,
             self.router,
             self.statistics_tracker,
-            serial_factory=self.serial_factory,
             raw_chunk_callback=self.raw_chunk_callback,
             wire_chunk_callback=self.wire_chunk_callback,
         )
@@ -143,15 +149,29 @@ class DeviceSession:
                 expect_pong=True,
             )
 
-    def _close_candidate(self, worker: SerialWorker) -> None:
-        with suppress(BaseException):
+    def _close_candidate(self, worker: SerialWorker) -> BaseException | None:
+        cleanup_error: BaseException | None = None
+        try:
             worker.close()
+        except BaseException as error:
+            cleanup_error = error
         with suppress(BaseException):
             self.router.close()
+        if worker.owned_workers_alive:
+            self.worker = worker
+            self.state = DeviceState.ERROR
+            return cleanup_error or WorkerTerminatedError(
+                "failed baud candidate left an owned worker alive"
+            )
         self.worker = None
         self.state = DeviceState.CLOSED
+        return None
 
     def configure(self, config: X4Config) -> None:
+        with self.operation_lock:
+            self._configure_locked(config)
+
+    def _configure_locked(self, config: X4Config) -> None:
         # Reference: ./Legacy-SW/ModuleConnector/Latest_MC_examples/PYTHON/
         # xt_modules_plot_record_playback_radar_raw_data_message_2D.py (`configure_x4`).
         self._require(DeviceState.OPEN, DeviceState.STOPPED)
@@ -182,6 +202,10 @@ class DeviceSession:
         LOGGER.info("configured X4M200: %s", config)
 
     def start(self, first_frame_timeout: float = 2.0) -> None:
+        with self.operation_lock:
+            self._start_locked(first_frame_timeout)
+
+    def _start_locked(self, first_frame_timeout: float) -> None:
         self._require(DeviceState.CONFIGURED)
         if self.config is None:
             raise InvalidDeviceStateError("no X4 configuration is available")
@@ -198,6 +222,10 @@ class DeviceSession:
         LOGGER.info("capture started at %.3f FPS", self.config.fps)
 
     def stop(self) -> None:
+        with self.operation_lock:
+            self._stop_locked()
+
+    def _stop_locked(self) -> None:
         if self.state in (DeviceState.CLOSED, DeviceState.CLOSING):
             return
         if self.worker is not None and self.worker.alive:
@@ -214,6 +242,10 @@ class DeviceSession:
 
     def switch_baudrate(self, baudrate: int) -> None:
         """Change both ends using the direct command, then verify at the new rate."""
+        with self.operation_lock:
+            self._switch_baudrate_locked(baudrate)
+
+    def _switch_baudrate_locked(self, baudrate: int) -> None:
         # Reference: ./Legacy-SW/MCPWrapper/mcp_wrapper_1.3.1/examples/generic/src/main.cpp
         if baudrate not in (115200, 921600):
             raise ValueError("supported baudrates are 115200 and 921600")
@@ -245,13 +277,17 @@ class DeviceSession:
         return item
 
     def close(self) -> None:
+        with self.operation_lock:
+            self._close_locked(passive=False)
+
+    def _close_locked(self, *, passive: bool) -> None:
         if self.state is DeviceState.CLOSED:
             return
         self._transition(DeviceState.CLOSING)
         worker = self.worker
         first_error: BaseException | None = None
         if worker is not None:
-            if worker.alive:
+            if worker.alive and not passive:
                 self._best_effort("FPS 0", build_set_fps(0))
                 self._best_effort("STOP", build_set_sensor_mode(SensorMode.STOP))
             try:
@@ -264,6 +300,13 @@ class DeviceSession:
             if first_error is None:
                 first_error = error
         finally:
+            self.invalidate_output_state()
+        if worker is not None and worker.owned_workers_alive:
+            self.worker = worker
+            self._transition(DeviceState.ERROR)
+            if first_error is None:
+                first_error = WorkerTerminatedError("owned worker remains alive after close")
+        else:
             self.worker = None
             self._transition(DeviceState.CLOSED)
         if first_error is not None:
@@ -271,40 +314,36 @@ class DeviceSession:
 
     def close_passive(self) -> None:
         """Close without transmitting; used only by sniffing and probing."""
-        if self.state is DeviceState.CLOSED:
-            return
-        self._transition(DeviceState.CLOSING)
-        worker = self.worker
-        first_error: BaseException | None = None
-        if worker is not None:
-            try:
-                worker.close()
-            except BaseException as error:
-                first_error = error
-        try:
-            self.router.close()
-        except BaseException as error:
-            if first_error is None:
-                first_error = error
-        finally:
-            self.worker = None
-            self._transition(DeviceState.CLOSED)
-        if first_error is not None:
-            raise first_error
+        with self.operation_lock:
+            self._close_locked(passive=True)
 
     def recover(self) -> None:
         """Discard a desynchronized transport and reopen in a known STOP state."""
+        with self.operation_lock:
+            self._recover_locked()
+
+    def _recover_locked(self) -> None:
         if self.state is not DeviceState.DESYNCHRONIZED:
             raise InvalidDeviceStateError("recover() is only valid after a command timeout")
         if self.worker is not None:
-            with suppress(BaseException):
+            try:
                 self.worker.close()
+            except BaseException:
+                if self.worker.owned_workers_alive:
+                    self._transition(DeviceState.ERROR)
+                    raise
         self.router.close()
+        if self.worker is not None and self.worker.owned_workers_alive:
+            self._transition(DeviceState.ERROR)
+            raise WorkerTerminatedError("cannot recover while an owned worker remains alive")
         self.worker = None
         self._transition(DeviceState.CLOSED)
         self.open()
         self._command("RECOVER STOP", build_set_sensor_mode(SensorMode.STOP))
         self._transition(DeviceState.STOPPED)
+
+    def invalidate_output_state(self) -> None:
+        self.output_state_cache.clear()
 
     def statistics(self) -> SessionStatistics:
         return self.statistics_tracker.snapshot()

@@ -27,10 +27,7 @@ the datatype size, accepts the integer variant with or without the trailing
 size, and rejects ambiguous lengths. Empty integer replies may omit count and
 size; other typed empty replies carry their size byte.
 
-Real getter replies from Annapurna 1.6.6 are stored in
-`tests/golden/fixtures/device_getters_0_2.mcpbin`. The observed sensor-mode
-reply uses content ID zero, which takes precedence over the absent callback in
-the checked-in XEP target application.
+Live replies from Annapurna 1.6.6 use content ID zero for sensor-mode and output-control getters. This observation takes precedence over the absent callback in the checked-in XEP target application. MXS 0.2.3 does not retain traffic captures because pytest must obtain every device response from the connected module.
 
 ## Baseband APPDATA structure sizing
 
@@ -40,7 +37,7 @@ format size. The target builders establish the actual 29-byte fixed header,
 followed by `num_bins` I floats and `num_bins` Q floats. The Python parser uses
 the target layout.
 
-## SleepStatus fixture terminology
+## SleepStatus checksum terminology
 
 The plan calls the XOR field a CRC. The local implementation is bytewise XOR,
 initialized with `0x7d`, rather than a polynomial CRC. Public counters retain

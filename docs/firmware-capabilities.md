@@ -2,7 +2,7 @@
 
 ## Tested device
 
-Safe hardware validation on 2026-07-14 used:
+Safe hardware validation on 2026-07-15 used:
 
 | Field | Value |
 |---|---|
@@ -19,6 +19,8 @@ System information, sensor mode, profile ID, raw RF, downconverted IQ, reopen, a
 
 Application getters require a loaded profile on this firmware. With profile ID 0, sensitivity and TX-frequency getters return firmware error 1; several other application getters do not reply. The corrected version-list request at `0x07` passed on 2026-07-14. MXS records probe failures by category and does not infer support from product identity.
 
-The sources declare extended-respiration feature ID `0x2375A16B` but do not define its payload. On the tested firmware, querying that output returned a reply with content ID zero instead of the requested feature ID. Support therefore remains unknown, and no decoder layout is inferred from the identifier alone.
+The sources declare extended-respiration feature ID `0x2375A16B` but define no command producer, APPDATA layout, parser, or usage example. MXS classifies the feature as firmware-unsupported and rejects set, get, debug-set, and debug-get operations before transmission. The identifier remains public so applications can recognize the known feature without implying support.
 
 Periodic noisemap storage, XEP normalization/phase-noise/decimation/number-format/legacy-output controls, and X4Driver I2C access appear in public host headers but have no command producer in the checked-in target source. They raise `UnsupportedFirmwareError` rather than emitting guessed bytes.
+
+The 2026-07-15 device suite observed sleep, respiration, and baseband-IQ messages from `ProfileId.RESPIRATION_2`. Baseband IQ and amplitude/phase state was queried from the device before and after changes because those outputs are mutually exclusive. Capability booleans for extended respiration and periodic noisemap storage are therefore `False`, not unknown.

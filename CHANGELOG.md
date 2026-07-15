@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.3 - 2026-07-15
+
+- Reject extended respiration, periodic noisemap storage, undocumented XEP controls, and X4Driver I2C access with `UnsupportedFirmwareError` before transmission.
+- Serialize unsafe authorization, sensor-mode verification, and action under the same session operation lock used by profile and acquisition state changes.
+- Keep sessions in `ERROR` with their worker reference intact when any owned transport worker survives shutdown.
+- Synchronize mutually exclusive output controls from device state and invalidate the cache across profile, reset, close, and reopen boundaries.
+- Remove serial-factory injection, simulated firmware responses, checked-in traffic fixtures, offline pytest suites, and the long soak test.
+- Require every pytest test to use the real X4M200 at `/dev/tty.usbmodem2101` and fail setup when it is unavailable or busy.
+- Validate real identity, both baud rates, RF and IQ acquisition, 512-frame async acquisition, application messages, recording, reopen, unsupported behavior, and disabled unsafe operations.
+
 ## 0.2.2 - validation pending
 
 - Isolated every baud probe in a fresh command manager, router, subscription set, and serial worker.

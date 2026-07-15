@@ -20,7 +20,7 @@ from .interfaces import (
 from .models import CirFrame, SessionStatistics, X4Config
 from .router import QueuePolicy
 from .session import DeviceSession
-from .transport import SerialFactory, WireChunk
+from .transport import WireChunk
 
 
 class X4M200:
@@ -32,7 +32,6 @@ class X4M200:
         frame_queue_size: int = 256,
         overflow_policy: QueuePolicy = "error",
         command_timeout: float = 2.0,
-        serial_factory: SerialFactory | None = None,
         raw_chunk_callback: Callable[[bytes], None] | None = None,
         wire_chunk_callback: Callable[[WireChunk], None] | None = None,
     ) -> None:
@@ -42,7 +41,6 @@ class X4M200:
             frame_queue_size=frame_queue_size,
             overflow_policy=overflow_policy,
             command_timeout=command_timeout,
-            serial_factory=serial_factory,
             raw_chunk_callback=raw_chunk_callback,
             wire_chunk_callback=wire_chunk_callback,
         )

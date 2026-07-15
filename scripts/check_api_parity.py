@@ -21,6 +21,11 @@ from mxs.interfaces.core import (
 ROOT = Path(__file__).resolve().parents[1]
 HEADER_ROOT = ROOT / "Legacy-SW/ModuleConnector/ModuleConnector-osx-1/include"
 MANIFEST = ROOT / "docs/x4m200-api-parity.md"
+EXTENDED_RESPIRATION_ROW = (
+    "| `OutputFeature.RESPIRATION_EXTENDED` | `device.outputs.set_output_control`, "
+    "`device.outputs.get_output_control` | no authoritative producer or APPDATA layout | "
+    "firmware-unsupported |"
+)
 METHOD = re.compile(r"^\s+int\s+([A-Za-z_]\w*)\s*\(", re.MULTILINE)
 ROW = re.compile(r"^\| (X4M200|XEP) \| `([A-Za-z_]\w*)` \|", re.MULTILINE)
 
@@ -196,6 +201,8 @@ def audit() -> list[str]:
         if (interface, method) not in documented
     ]
     rows = manifest_rows()
+    if EXTENDED_RESPIRATION_ROW not in MANIFEST.read_text(encoding="utf-8"):
+        problems.append("OutputFeature.RESPIRATION_EXTENDED: missing unsupported classification")
     for interface in ("X4M200", "XEP"):
         for method in header_methods(interface):
             key = (interface, method)
@@ -227,7 +234,7 @@ def write_manifest() -> None:
         ),
         (
             "| Interface | Legacy method | Local source | Command or message | Expected "
-            "response | MXS API | Offline test | Hardware test | Firmware requirement | Status |"
+            "response | MXS API | Pytest evidence | Hardware test | Firmware requirement | Status |"
         ),
         "|---|---|---|---|---|---|---|---|---|---|",
     ]
@@ -245,8 +252,17 @@ def write_manifest() -> None:
             source = f"Legacy-SW/ModuleConnector/ModuleConnector-osx-1/include/{interface}.hpp"
             lines.append(
                 f"| {interface} | `{method}` | `{source}` | {command} | {response} | `{api}` | "
-                f"unit/golden | safe where applicable | see firmware-capabilities | {status} |"
+                f"real X4M200 | safe where applicable | see firmware-capabilities | {status} |"
             )
+    lines.extend(
+        [
+            "\n## Known output-feature restrictions",
+            "",
+            "| Feature | MXS API | Reason | Status |",
+            "|---|---|---|---|",
+            EXTENDED_RESPIRATION_ROW,
+        ]
+    )
     MANIFEST.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 

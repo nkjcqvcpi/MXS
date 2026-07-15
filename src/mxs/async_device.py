@@ -10,7 +10,6 @@ from .discovery import discover_port
 from .models import CirFrame, SessionStatistics, X4Config
 from .router import QueuePolicy
 from .session import DeviceSession
-from .transport import SerialFactory
 
 
 class _AsyncInterface:
@@ -45,7 +44,6 @@ class AsyncX4M200:
         frame_queue_size: int = 256,
         overflow_policy: QueuePolicy = "error",
         command_timeout: float = 2.0,
-        serial_factory: SerialFactory | None = None,
     ) -> None:
         self._session = DeviceSession(
             port or discover_port(),
@@ -53,7 +51,6 @@ class AsyncX4M200:
             frame_queue_size=frame_queue_size,
             overflow_policy=overflow_policy,
             command_timeout=command_timeout,
-            serial_factory=serial_factory,
         )
         self._bridge_thread: threading.Thread | None = None
         self._bridge_stop = threading.Event()

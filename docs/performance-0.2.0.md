@@ -1,6 +1,6 @@
 # MXS 0.2.0 performance
 
-Benchmarks ran on 2026-07-14 with Python 3.14.6 and real X4M200 wire recordings from `tests/golden/fixtures`.
+Benchmarks ran on 2026-07-14 with Python 3.14.6 and real X4M200 wire recordings. The recordings were removed in 0.2.3 when pytest became hardware-only; this document retains the historical measurements, not reusable test inputs.
 
 | Fixture | Bytes processed | Time | Throughput | Relative to 92,160 B/s |
 |---|---:|---:|---:|---:|

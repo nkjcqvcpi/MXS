@@ -21,9 +21,13 @@ reported to every pending reader. The same object may be closed and reopened
 after the device re-enumerates. After any command timeout, call `recover()`; do not
 send another command on the old transport.
 
-Hardware and soak tests are explicit:
+Pytest always requires the fixed real device. It has no offline or soak selection:
 
 ```bash
-MXS_TEST_PORT=/dev/tty.usbmodem2101 uv run pytest -m "hardware and not soak and not unsafe"
-MXS_TEST_PORT=/dev/tty.usbmodem2101 MXS_SOAK_SECONDS=1800 uv run pytest -m "hardware and soak and not unsafe"
+PORT=/dev/tty.usbmodem2101
+test -c "$PORT"
+! lsof "$PORT" | grep -q .
+MXS_TEST_PORT="$PORT" uv run pytest -x
 ```
+
+Missing, busy, unidentified, or unresponsive hardware aborts the run. The unsafe tests verify only disabled gates and state rejection; they never send destructive commands.

@@ -73,14 +73,18 @@ Any command timeout marks the session desynchronized, closes the transport, and 
 
 Firmware-dependent behavior is conservative. Unknown support is never reported as supported, and functions with no local producer or a negative probe raise `UnsupportedFirmwareError`. The tested firmware matrix is in [firmware capabilities](docs/firmware-capabilities.md).
 
+Extended respiration, periodic noisemap storage, the undocumented XEP normalization, phase-noise, decimation, number-format and legacy-output controls, and X4Driver I2C access are explicitly unsupported. Their public methods reject the call before transmitting bytes.
+
 ## Development
 
 ```bash
 uv run ruff format .
 uv run ruff check .
 uv run pyright
-uv run pytest -m "not hardware and not soak and not unsafe" --cov=mxs
+MXS_TEST_PORT=/dev/tty.usbmodem2101 uv run pytest -x
 uv build
 ```
 
-Protocol provenance is recorded in [source map](docs/source-map.md), [protocol notes](docs/protocol-notes.md), and [upstream sources](docs/upstream-sources.md). Release-specific changes are in [the 0.2.2 migration guide](docs/migration-0.2.1-to-0.2.2.md).
+Pytest requires the real X4M200 at the fixed path. Collection aborts if a test does not depend on the device fixture, and setup aborts if the port is missing, occupied, unidentified, or unresponsive. The suite contains no fake serial device, synthetic firmware response, checked-in traffic capture, or soak test.
+
+Protocol provenance is recorded in [source map](docs/source-map.md), [protocol notes](docs/protocol-notes.md), and [upstream sources](docs/upstream-sources.md). Release-specific changes are in [the 0.2.3 migration guide](docs/migration-0.2.2-to-0.2.3.md).

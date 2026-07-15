@@ -1,114 +1,76 @@
-import threading
-import time
-from collections import deque
+"""Mandatory real-X4M200 pytest preflight and restoration."""
 
-from mxs.commands import build_ping, build_set_fps
-from mxs.framing import encode_classic_frame
+import os
+import stat
+import subprocess
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Protocol, cast
 
-SLEEP_FRAME = bytes.fromhex(
-    "7d506ca1752350050000040000000000000000000000000000000000000000000000e77e"
-)
+import pytest
 
+from mxs import X4M200
+from mxs.constants import SensorMode
 
-class FakeSerial:
-    def __init__(
-        self,
-        baudrate: int,
-        *,
-        partial_read: int = 17,
-        partial_write: int = 4,
-        initial_stream: bool = True,
-        data_before_ack: bool = True,
-        emit_start_frame: bool = True,
-    ) -> None:
-        self.baudrate = baudrate
-        self.partial_read = partial_read
-        self.partial_write = partial_write
-        self.data_before_ack = data_before_ack
-        self.emit_start_frame = emit_start_frame
-        self.closed = False
-        self.disconnected = False
-        self.reject_next = False
-        self.suppress_next_response = False
-        self.suppress_all_responses = False
-        self.delay_ack = 0.0
-        self.writes: list[bytes] = []
-        self._incoming: deque[int] = deque(SLEEP_FRAME if initial_stream else b"")
-        self._outgoing = bytearray()
-        self._condition = threading.Condition()
-
-    def readinto(self, buffer: bytearray) -> int:
-        if self.disconnected:
-            raise OSError("fake disconnect")
-        deadline = time.monotonic() + 0.01
-        with self._condition:
-            while not self._incoming and not self.closed and time.monotonic() < deadline:
-                self._condition.wait(0.002)
-            count = min(len(buffer), self.partial_read, len(self._incoming))
-            for index in range(count):
-                buffer[index] = self._incoming.popleft()
-            return count
-
-    def write(self, data: bytes | memoryview) -> int:
-        if self.disconnected:
-            raise OSError("fake disconnect")
-        chunk = bytes(data[: self.partial_write])
-        self._outgoing.extend(chunk)
-        if chunk and self._outgoing[-1] == 0x7E:
-            packet = bytes(self._outgoing)
-            self._outgoing.clear()
-            self.writes.append(packet)
-            self._respond(packet)
-        return len(chunk)
-
-    def _respond(self, packet: bytes) -> None:
-        if self.suppress_all_responses:
-            return
-        if self.suppress_next_response:
-            self.suppress_next_response = False
-            return
-        if self.delay_ack:
-            time.sleep(self.delay_ack)
-        if packet == build_ping():
-            response = encode_classic_frame(b"\x01\xea\xae\xee\xaa")
-        elif self.reject_next:
-            response = encode_classic_frame(b"\x20\x21\x00\x00\x00")
-            self.reject_next = False
-        else:
-            response = encode_classic_frame(b"\x10")
-        frame = encode_classic_frame(
-            b"\xa0\x12\x00\x00\x00\x00\x2a\x00\x00\x00\x04\x00\x00\x00"
-            + b"\x00\x00\x80?\x00\x00\x00@\x00\x00@@\x00\x00\x80@"
-        )
-        if packet == build_set_fps(17.0) and not self.emit_start_frame:
-            self.inject(response)
-        elif packet == build_set_fps(17.0) and self.data_before_ack:
-            self.inject(frame + response)
-        elif packet == build_set_fps(17.0):
-            self.inject(response + frame)
-        else:
-            self.inject(response)
-
-    def inject(self, data: bytes) -> None:
-        with self._condition:
-            self._incoming.extend(data)
-            self._condition.notify_all()
-
-    def flush(self) -> None:
-        pass
-
-    def close(self) -> None:
-        self.closed = True
-        with self._condition:
-            self._condition.notify_all()
+DEVICE_PORT = "/dev/tty.usbmodem2101"
 
 
-class FakeSerialFactory:
-    def __init__(self, **options: object) -> None:
-        self.options = options
-        self.instances: list[FakeSerial] = []
+class _FixtureItem(Protocol):
+    nodeid: str
+    fixturenames: list[str]
 
-    def __call__(self, _port: str, baudrate: int) -> FakeSerial:
-        serial = FakeSerial(baudrate, **self.options)  # type: ignore[arg-type]
-        self.instances.append(serial)
-        return serial
+
+def _require_character_device(port: str) -> None:
+    try:
+        mode = Path(port).stat().st_mode
+    except OSError as error:
+        raise pytest.UsageError(f"X4M200 is unavailable at {port}: {error}") from error
+    if not stat.S_ISCHR(mode):
+        raise pytest.UsageError(f"X4M200 path is not a character device: {port}")
+
+
+def _require_free_port(port: str) -> None:
+    result = subprocess.run(["lsof", port], capture_output=True, check=False, text=True)
+    if result.returncode not in (0, 1):
+        raise pytest.UsageError(f"lsof failed for {port}: {result.stderr.strip()}")
+    if result.stdout.strip():
+        raise pytest.UsageError(f"X4M200 serial port is busy:\n{result.stdout.rstrip()}")
+
+
+def _restore_stop_and_baud(port: str) -> None:
+    with X4M200(port=port, baudrate="auto") as device:
+        pong = device.module.ping()
+        if not pong.ready:
+            raise RuntimeError("X4M200 firmware did not report ready")
+        if device.module.get_system_info(1).strip() != "X4M200":
+            raise RuntimeError("connected serial module is not an X4M200")
+        device.profile.set_sensor_mode(SensorMode.STOP)
+        if device.detected_baudrate != 115200:
+            device.module.set_baudrate(115200)
+        if device.profile.get_sensor_mode() is not SensorMode.STOP:
+            raise RuntimeError("X4M200 did not enter STOP mode")
+
+
+@pytest.fixture(scope="session")
+def device_port() -> Iterator[str]:
+    configured = os.getenv("MXS_TEST_PORT", DEVICE_PORT)
+    if configured != DEVICE_PORT:
+        raise pytest.UsageError(f"MXS_TEST_PORT must be the fixed device path {DEVICE_PORT}")
+    _require_character_device(DEVICE_PORT)
+    _require_free_port(DEVICE_PORT)
+    try:
+        _restore_stop_and_baud(DEVICE_PORT)
+    except BaseException as error:
+        raise pytest.UsageError(f"X4M200 preflight failed: {error}") from error
+    yield DEVICE_PORT
+    _require_character_device(DEVICE_PORT)
+    _require_free_port(DEVICE_PORT)
+    _restore_stop_and_baud(DEVICE_PORT)
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    fixture_items = (cast("_FixtureItem", item) for item in items)
+    missing = [item.nodeid for item in fixture_items if "device_port" not in item.fixturenames]
+    if missing:
+        joined = "\n".join(missing)
+        raise pytest.UsageError(f"every test must require the real-device fixture:\n{joined}")

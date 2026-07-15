@@ -24,7 +24,8 @@ class DeviceCapabilities:
     supports_vital_signs: bool | None = None
     supports_normalized_movement: bool | None = None
     supports_default_noisemap: bool | None = None
-    supports_periodic_noisemap_store: bool | None = None
+    supports_periodic_noisemap_store: bool | None = False
+    supports_extended_respiration: bool | None = False
     supports_baseband_ap: bool | None = None
     supports_pulse_doppler: bool | None = None
     supports_device_filesystem: bool | None = None

@@ -50,7 +50,6 @@ class BaudRequest:
 
 
 Request = WriteRequest | BaudRequest
-SerialFactory = Callable[[str, int], SerialLike]
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +79,10 @@ class DecoderWorker:
 
     def start(self) -> None:
         self._thread.start()
+
+    @property
+    def alive(self) -> bool:
+        return self._thread.is_alive()
 
     def submit(self, payload: bytes) -> None:
         control_types = {
@@ -154,6 +157,10 @@ class RawCallbackWorker:
     def start(self) -> None:
         self._thread.start()
 
+    @property
+    def alive(self) -> bool:
+        return self._thread.is_alive()
+
     def submit(self, chunk: WireChunk) -> None:
         if self.error is not None:
             raise self.error
@@ -195,7 +202,6 @@ class SerialWorker:
         router: MessageRouter,
         statistics: StatisticsTracker,
         *,
-        serial_factory: SerialFactory | None = None,
         raw_chunk_callback: Callable[[bytes], None] | None = None,
         wire_chunk_callback: Callable[[WireChunk], None] | None = None,
         tx_capacity: int = 64,
@@ -204,7 +210,6 @@ class SerialWorker:
         self.baudrate = baudrate
         self.router = router
         self.statistics = statistics
-        self.serial_factory = serial_factory
         self.raw_chunk_callback = raw_chunk_callback
         self.wire_chunk_callback = wire_chunk_callback
         self.decoder = McpStreamDecoder()
@@ -231,6 +236,14 @@ class SerialWorker:
     @property
     def alive(self) -> bool:
         return self._thread.is_alive()
+
+    @property
+    def owned_workers_alive(self) -> bool:
+        return (
+            self.alive
+            or self.decoder_worker.alive
+            or (self.raw_worker is not None and self.raw_worker.alive)
+        )
 
     def start(self, timeout: float = 3.0) -> None:
         self.decoder_worker.start()
@@ -282,8 +295,6 @@ class SerialWorker:
             raise first_error
 
     def _open_serial(self) -> SerialLike:
-        if self.serial_factory is not None:
-            return self.serial_factory(self.port, self.baudrate)
         try:
             opened = serial.Serial(
                 port=self.port,
