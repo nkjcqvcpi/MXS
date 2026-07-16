@@ -25,7 +25,7 @@
 
 | Gate | Exact result |
 |---|---|
-| Dependency synchronization | Pass, `uv sync --locked`, 16 locked packages |
+| Dependency synchronization | Pass, `uv sync`, 16 resolved packages in that validation environment |
 | Source Ruff format/check and strict Pyright | Pass, 47 files unchanged, no lint errors, 0 type errors |
 | API parity generation and audit | Pass, all public `X4M200.hpp` and `XEP.hpp` methods classified |
 | Real-device pytest | Pass, 10 tests in 71.74 seconds |

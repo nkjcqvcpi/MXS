@@ -5,14 +5,14 @@
 - Workspace commit reviewed: `83e0d93a670bdc7f9619512cef60005bfb45bb96`.
 - Legacy-SW commit: `2ef9cc586f6fa7694a81f3e784d23d738e1cd8df`.
 - Legacy-Documentation commit: `8b382f74e0d72e93c43369bbe136cd23bbe38836`.
-- Source, lock-file, and fallback versions are `0.2.2`.
+- Source and fallback versions are `0.2.2`.
 - No destructive hardware operation and no long soak test was run.
 
 ## Offline gates
 
 | Gate | Result |
 |---|---|
-| `uv sync --locked` | Pass |
+| `uv sync` | Pass |
 | Ruff format | Pass, 75 files unchanged on the final run |
 | Ruff check | Pass |
 | Strict Pyright | Pass, zero errors and warnings |

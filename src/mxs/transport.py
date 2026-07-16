@@ -193,6 +193,9 @@ class RawCallbackWorker:
         self._condition = threading.Condition()
         self._submitted = 0
         self._completed = 0
+        # Queue user callbacks during baud-candidate probing. Acceptance releases
+        # delivery only after the session has atomically transitioned to OPEN.
+        self._delivery_enabled = threading.Event()
 
     def start(self) -> None:
         self._thread.start()
@@ -223,6 +226,9 @@ class RawCallbackWorker:
             raise WorkerTerminatedError("raw recording worker failed to terminate")
         self.raise_if_failed()
 
+    def enable_delivery(self) -> None:
+        self._delivery_enabled.set()
+
     def flush_callbacks(self, timeout: float) -> None:
         with self._condition:
             target = self._submitted
@@ -252,6 +258,9 @@ class RawCallbackWorker:
                     chunk = self.queue.get(timeout=0.02)
                 except queue.Empty:
                     continue
+                while not self._delivery_enabled.wait(0.02):
+                    if self._stop.is_set():
+                        return
                 try:
                     self.callback(chunk)
                 finally:
@@ -339,6 +348,15 @@ class SerialWorker:
                 remaining = max(0.0, timeout - (time.monotonic() - started))
                 self.raw_worker.flush_callbacks(remaining)
             self.raise_if_failed()
+
+    def accept_candidate(self, timeout: float, accept: Callable[[], None]) -> None:
+        """Atomically flush and accept a baud candidate behind the RX barrier."""
+        with self._callback_submission_lock:
+            self.decoder_worker.flush_callbacks(timeout)
+            self.raise_if_failed()
+            accept()
+            if self.raw_worker is not None:
+                self.raw_worker.enable_delivery()
 
     def raise_if_failed(self) -> None:
         with self._failure_lock:

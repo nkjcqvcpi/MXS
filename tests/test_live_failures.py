@@ -2,6 +2,7 @@
 
 import inspect
 import threading
+import time
 from contextlib import suppress
 from typing import Never
 
@@ -9,50 +10,66 @@ import pytest
 import serial
 
 from mxs import X4M200, X4Config
+from mxs.commands import build_ping
 from mxs.constants import DeviceState, SensorMode
-from mxs.errors import BaudDetectionError, InvalidDeviceStateError, WorkerTerminatedError
+from mxs.errors import InvalidDeviceStateError
 from mxs.interfaces.core import Interface
 from mxs.session import DeviceSession
 from mxs.transport import SerialWorker, WireChunk
 
 
 @pytest.mark.hardware
-@pytest.mark.stateful
 def test_real_rx_callback_failure_promotes_session_error(device_port: str) -> None:
     called = threading.Event()
     failure = RuntimeError("real RX callback failure")
+    states: list[DeviceState] = []
+    session = DeviceSession(device_port, 115200)
 
     def fail_on_rx(_chunk: bytes) -> None:
+        states.append(session.state)
         called.set()
         raise failure
 
-    session = DeviceSession(device_port, 115200, raw_chunk_callback=fail_on_rx)
+    session.raw_chunk_callback = fail_on_rx
     try:
-        with pytest.raises(RuntimeError, match="real RX callback failure"):
-            session.open()
+        session.open()
         assert called.wait(2.0)
-        assert session.state is DeviceState.CLOSED
-        assert session.worker is None
+        assert states == [DeviceState.OPEN]
+        deadline = time.monotonic() + 1.0
+        while session.state is DeviceState.OPEN and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert session.state is DeviceState.ERROR
     finally:
         with suppress(BaseException):
             session.close()
 
 
 @pytest.mark.hardware
-@pytest.mark.stateful
 def test_opening_wire_recorder_failure_is_fatal(device_port: str) -> None:
+    called = threading.Event()
+    states: list[DeviceState] = []
+    session = DeviceSession(device_port, 115200)
+
     def fail_on_wire(_chunk: WireChunk) -> None:
+        states.append(session.state)
+        called.set()
         raise RuntimeError("opening wire recorder failure")
 
-    session = DeviceSession(device_port, 115200, wire_chunk_callback=fail_on_wire)
-    with pytest.raises(RuntimeError, match="opening wire recorder failure"):
+    session.wire_chunk_callback = fail_on_wire
+    try:
         session.open()
-    assert session.state is DeviceState.CLOSED
-    assert session.worker is None
+        assert called.wait(2.0)
+        assert states == [DeviceState.OPEN]
+        deadline = time.monotonic() + 1.0
+        while session.state is DeviceState.OPEN and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert session.state is DeviceState.ERROR
+    finally:
+        with suppress(BaseException):
+            session.close()
 
 
 @pytest.mark.hardware
-@pytest.mark.stateful
 def test_opening_decoder_failure_is_fatal(
     device_port: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -71,7 +88,6 @@ def test_opening_decoder_failure_is_fatal(
 
 
 @pytest.mark.hardware
-@pytest.mark.stateful
 def test_opening_serial_failure_is_fatal(device_port: str, monkeypatch: pytest.MonkeyPatch) -> None:
     original = SerialWorker._drain_requests  # pyright: ignore[reportPrivateUsage]
     raised = False
@@ -94,45 +110,68 @@ def test_opening_serial_failure_is_fatal(device_port: str, monkeypatch: pytest.M
 
 
 @pytest.mark.hardware
-@pytest.mark.stateful
-def test_terminated_serial_worker_cannot_become_open(device_port: str) -> None:
-    session = DeviceSession(device_port, 115200)
-
-    def terminate_on_real_rx(_chunk: bytes) -> None:
-        assert session.worker is not None
-        session.worker._stop.set()  # pyright: ignore[reportPrivateUsage]
-
-    session.raw_chunk_callback = terminate_on_real_rx
-    with pytest.raises(BaudDetectionError, match="termination requested unexpectedly"):
-        session.open()
-    assert session.state is DeviceState.CLOSED
-    assert session.worker is None
-
-
-@pytest.mark.hardware
-@pytest.mark.stateful
-@pytest.mark.timeout(30)
-def test_blocked_opening_callback_retains_worker_until_cleanup(device_port: str) -> None:
+def test_opening_callback_can_reenter_device_api(device_port: str) -> None:
     entered = threading.Event()
-    release = threading.Event()
+    completed = threading.Event()
+    failure: list[BaseException] = []
+    observed: list[DeviceState] = []
+    once = threading.Event()
+    device: X4M200
 
-    def block_on_rx(_chunk: bytes) -> None:
+    def reenter_on_rx(_chunk: bytes) -> None:
+        if once.is_set():
+            return
+        once.set()
+        observed.append(device.state)
         entered.set()
-        assert release.wait(10.0)
+        try:
+            assert device.module.ping().ready
+        except BaseException as error:
+            failure.append(error)
+        finally:
+            completed.set()
 
-    session = DeviceSession(device_port, 115200, raw_chunk_callback=block_on_rx)
-    with pytest.raises(WorkerTerminatedError):
-        session.open()
-    assert entered.is_set()
-    assert session.state is DeviceState.ERROR
-    assert session.worker is not None and session.worker.owned_workers_alive
-    release.set()
-    session.close()
-    assert session.state is DeviceState.CLOSED and session.worker is None
+    device = X4M200(port=device_port, baudrate=115200, raw_chunk_callback=reenter_on_rx)
+    try:
+        device.open()
+        assert entered.wait(1.0)
+        assert completed.wait(2.0)
+        assert observed == [DeviceState.OPEN]
+        assert failure == []
+    finally:
+        device.close()
 
 
 @pytest.mark.hardware
-@pytest.mark.stateful
+def test_new_rx_waits_behind_candidate_acceptance_barrier(
+    device_port: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = DeviceSession._transition  # pyright: ignore[reportPrivateUsage]
+    observed = threading.Event()
+
+    def transition_with_live_rx(self: DeviceSession, state: DeviceState) -> None:
+        original(self, state)
+        if state is not DeviceState.OPEN or observed.is_set():
+            return
+        worker = self.worker
+        assert worker is not None
+        submitted = worker.decoder_worker._submitted  # pyright: ignore[reportPrivateUsage]
+        received = self.statistics().bytes_received
+        worker.send(build_ping())
+        deadline = time.monotonic() + 1.0
+        while self.statistics().bytes_received == received and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert self.statistics().bytes_received > received
+        assert worker.decoder_worker._submitted == submitted  # pyright: ignore[reportPrivateUsage]
+        observed.set()
+
+    monkeypatch.setattr(DeviceSession, "_transition", transition_with_live_rx)
+    with X4M200(port=device_port, baudrate=115200) as device:
+        assert observed.wait(1.0)
+        assert device.module.ping().ready
+
+
+@pytest.mark.hardware
 def test_baud_candidate_returns_cleanup_error_after_live_workers_stop(
     device_port: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:

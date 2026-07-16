@@ -1,6 +1,7 @@
 """Short, non-destructive tests against the fixed X4M200 module."""
 
 import asyncio
+import struct
 import threading
 import time
 from collections.abc import Callable
@@ -15,11 +16,11 @@ from mxs.constants import OutputControl, OutputFeature, ProfileId, SensorMode, S
 from mxs.errors import (
     CommandRejectedError,
     InvalidDeviceStateError,
-    ProtocolError,
     UnsafeOperationDisabledError,
     UnsupportedFirmwareError,
 )
 from mxs.recording import WireRecorder, replay_wire, replay_wire_records
+from tests.conftest import DeviceBaseline
 
 
 def _assert_ordered_frames(frames: list[CirFrame]) -> None:
@@ -30,6 +31,17 @@ def _assert_ordered_frames(frames: list[CirFrame]) -> None:
 
 @pytest.mark.hardware
 def test_identity_protocol_and_capabilities(device_port: str) -> None:
+    invalid_configs = (
+        {"dac_min": 2, "dac_max": 1},
+        {"iterations": 0},
+        {"tx_center_frequency": 2},
+        {"tx_power": 4},
+        {"frame_area": (1.0, 1.0)},
+        {"fps": 0.0},
+    )
+    for values in invalid_configs:
+        with pytest.raises(ValueError):
+            X4Config(**values)  # pyright: ignore[reportArgumentType]
     with X4M200(port=device_port, baudrate="auto") as device:
         assert device.detected_baudrate == 115200
         assert device.module.ping().ready
@@ -56,7 +68,6 @@ def test_identity_protocol_and_capabilities(device_port: str) -> None:
 
 
 @pytest.mark.hardware
-@pytest.mark.stateful
 def test_baudrate_round_trips(device_port: str) -> None:
     try:
         with X4M200(port=device_port, baudrate=115200) as device:
@@ -80,6 +91,28 @@ def test_baudrate_round_trips(device_port: str) -> None:
 
 @pytest.mark.hardware
 @pytest.mark.stateful
+def test_profile_zero_reset_reconnect_and_restoration(device_port: str) -> None:
+    with X4M200(port=device_port, baudrate="auto") as device:
+        device.profile.load_profile(ProfileId.RESPIRATION_2)
+        started = time.monotonic()
+        device.module.reset()
+        assert time.monotonic() - started >= 0.6
+        assert device.detected_baudrate in (115200, 921600)
+        assert device.module.ping().ready
+        assert device.profile.get_profileid() == 0
+        assert device.profile.get_sensor_mode() is SensorMode.STOP
+
+        device.profile.load_profile(ProfileId.RESPIRATION_2)
+        assert device.profile.get_profileid() == ProfileId.RESPIRATION_2
+        started = time.monotonic()
+        device.profile.restore_profile(0)
+        assert time.monotonic() - started >= 0.6
+        assert device.module.ping().ready
+        assert device.profile.get_profileid() == 0
+        assert device.profile.get_sensor_mode() is SensorMode.STOP
+
+
+@pytest.mark.hardware
 @pytest.mark.parametrize(("downconversion", "dtype"), [(False, np.float32), (True, np.complex64)])
 def test_capture_100_frames(device_port: str, downconversion: bool, dtype: object) -> None:
     with X4M200(port=device_port, frame_queue_size=128) as device:
@@ -102,7 +135,6 @@ def test_capture_100_frames(device_port: str, downconversion: bool, dtype: objec
 
 
 @pytest.mark.hardware
-@pytest.mark.stateful
 @pytest.mark.asyncio
 @pytest.mark.timeout(45)
 async def test_async_capture_512_frames(device_port: str) -> None:
@@ -114,6 +146,9 @@ async def test_async_capture_512_frames(device_port: str) -> None:
         await device.__aenter__()
         assert await device.module.ping() is not None
         assert await device.profile.get_sensor_mode() is SensorMode.STOP
+        assert device.messages is not None
+        with pytest.raises(TimeoutError):
+            await device.read_frame(timeout=0.001)
         await device.configure(X4Config(downconversion=True))
         await device.start()
         cancelled = asyncio.create_task(device.read_frame(timeout=2.0))
@@ -142,9 +177,9 @@ def test_supported_profile_messages_and_outputs(device_port: str) -> None:
     with X4M200(port=device_port) as device:
         device.profile.set_sensor_mode(SensorMode.STOP)
         device.profile.load_profile(ProfileId.RESPIRATION_2)
-        sleep = device.messages.sleep.subscribe(32, "error")
-        respiration = device.messages.respiration.subscribe(32, "error")
-        baseband_iq = device.messages.baseband_iq.subscribe(32, "error")
+        sleep = device.messages.sleep.subscribe(32, "drop_oldest")
+        respiration = device.messages.respiration.subscribe(32, "drop_oldest")
+        baseband_iq = device.messages.baseband_iq.subscribe(32, "drop_oldest")
         device.outputs.set_output_control(OutputFeature.SLEEP, OutputControl.ENABLE)
         device.outputs.set_output_control(OutputFeature.RESPIRATION, OutputControl.ENABLE)
         device.outputs.set_output_control(OutputFeature.BASEBAND_IQ, OutputControl.ENABLE)
@@ -159,6 +194,21 @@ def test_supported_profile_messages_and_outputs(device_port: str) -> None:
             assert baseband_iq.read(timeout=8.0) is not None
         finally:
             device.profile.set_sensor_mode(SensorMode.STOP)
+
+        device.outputs.set_output_control(OutputFeature.BASEBAND_IQ, OutputControl.DISABLE)
+        device.profile.load_profile(ProfileId.RESPIRATION_2)
+        baseband_ap = device.messages.baseband_ap.subscribe(256, "drop_oldest")
+        try:
+            device.outputs.set_output_control(
+                OutputFeature.BASEBAND_AMPLITUDE_PHASE, OutputControl.ENABLE
+            )
+            device.profile.set_sensor_mode(SensorMode.RUN)
+            assert baseband_ap.read(timeout=3.0) is not None
+        finally:
+            device.profile.set_sensor_mode(SensorMode.STOP)
+            device.outputs.set_output_control(
+                OutputFeature.BASEBAND_AMPLITUDE_PHASE, OutputControl.DISABLE
+            )
         assert device.profile.get_sensor_mode() is SensorMode.STOP
 
 
@@ -190,33 +240,33 @@ def test_output_exclusivity_uses_live_state(
 
 
 @pytest.mark.hardware
-@pytest.mark.stateful
-def test_debug_output_behavior_is_live_and_typed(device_port: str) -> None:
-    pairs = (
-        (OutputFeature.BASEBAND_IQ, OutputFeature.BASEBAND_AMPLITUDE_PHASE),
-        (OutputFeature.PULSE_DOPPLER_FLOAT, OutputFeature.PULSE_DOPPLER_BYTE),
-        (OutputFeature.NOISEMAP_FLOAT, OutputFeature.NOISEMAP_BYTE),
-    )
-    outcomes: list[str] = []
+def test_debug_output_behavior_is_live_and_typed(
+    device_port: str, device_baseline: DeviceBaseline
+) -> None:
+    outcomes: dict[OutputFeature, str] = {}
     with X4M200(port=device_port) as device:
-        for first, second in pairs:
-            try:
-                device.outputs.get_debug_output_control(first)
-                device.outputs.get_debug_output_control(second)
-                device.outputs.set_debug_output_control(first, OutputControl.DISABLE)
-                device.outputs.set_debug_output_control(second, OutputControl.DISABLE)
-                device.outputs.set_debug_output_control(first, OutputControl.ENABLE)
-                with pytest.raises(InvalidDeviceStateError, match="mutually exclusive"):
-                    device.outputs.set_debug_output_control(second, OutputControl.ENABLE)
-                device.outputs.set_debug_output_control(first, OutputControl.DISABLE)
-                outcomes.append("supported")
-            except (CommandRejectedError, ProtocolError) as error:
-                outcomes.append(type(error).__name__)
-        assert len(outcomes) == len(pairs)
+        try:
+            for feature in OutputFeature:
+                try:
+                    device.outputs.get_debug_output_control(feature)
+                    outcomes[feature] = "supported"
+                except (CommandRejectedError, UnsupportedFirmwareError) as error:
+                    outcomes[feature] = type(error).__name__
+        finally:
+            for feature, control in device_baseline.debug_outputs.items():
+                if device.outputs.get_debug_output_control(feature) != control:
+                    device.outputs.set_debug_output_control(feature, control)
+        assert outcomes == {
+            **{feature: "supported" for feature in device_baseline.debug_outputs},
+            **device_baseline.debug_rejections,
+        }
+        assert {
+            feature: device.outputs.get_debug_output_control(feature)
+            for feature in device_baseline.debug_outputs
+        } == device_baseline.debug_outputs
 
 
 @pytest.mark.hardware
-@pytest.mark.stateful
 def test_five_second_wire_recording_and_replay(device_port: str, tmp_path: Path) -> None:
     path = tmp_path / "live.mcpbin"
     raw_chunks: list[bytes] = []
@@ -242,9 +292,32 @@ def test_five_second_wire_recording_and_replay(device_port: str, tmp_path: Path)
     assert b"".join(replayed_rx) == b"".join(raw_chunks)
     assert path.read_bytes().endswith(b"\xff\x00\x00\x00\x00")
 
+    captured = path.read_bytes()
+    corruptions = {
+        "magic": b"bad" + captured[3:],
+        "header": captured[:8],
+        "metadata": captured[:24],
+        "record-header": captured[:-3],
+    }
+    version_offset = len(b"MXSRAW1\0")
+    unsupported_version = bytearray(captured)
+    unsupported_version[version_offset : version_offset + 4] = struct.pack("<I", 99)
+    corruptions["version"] = bytes(unsupported_version)
+    metadata_length = struct.unpack_from("<I", captured, version_offset + 12)[0]
+    record_offset = version_offset + struct.calcsize("<IQI") + metadata_length
+    record_length = struct.unpack_from("<I", captured, record_offset + 9)[0]
+    corruptions["record-data"] = captured[: record_offset + 13 + max(0, record_length - 1)]
+    for name, content in corruptions.items():
+        malformed = tmp_path / f"{name}.mcpbin"
+        malformed.write_bytes(content)
+        with pytest.raises(ValueError):
+            list(replay_wire_records(malformed))
+    truncated = tmp_path / "recoverable.mcpbin"
+    truncated.write_bytes(captured[:-3])
+    list(replay_wire_records(truncated, recover_truncated=True))
+
 
 @pytest.mark.hardware
-@pytest.mark.stateful
 def test_five_reopen_cycles(device_port: str) -> None:
     for _ in range(5):
         with X4M200(port=device_port, baudrate=115200) as device:
@@ -265,22 +338,22 @@ def test_all_unsupported_apis_transmit_nothing(device_port: str) -> None:
             ),
             lambda: device.outputs.get_debug_output_control(OutputFeature.RESPIRATION_EXTENDED),
             lambda: device.noisemap.set_periodic_noisemap_store(1, 0),
-            device.noisemap.get_periodic_noisemap_store,
+            lambda: device.noisemap.get_periodic_noisemap_store(),
             lambda: device.xep.set_normalization(1),
             lambda: device.xep.set_normalization(value=1),
-            device.xep.get_normalization,
+            lambda: device.xep.get_normalization(),
             lambda: device.xep.set_phase_noise_correction(1, 0.0),
             lambda: device.xep.set_phase_noise_correction(enable=1, correction_distance=0.0),
-            device.xep.get_phase_noise_correction,
+            lambda: device.xep.get_phase_noise_correction(),
             lambda: device.xep.set_decimation_factor(2),
             lambda: device.xep.set_decimation_factor(factor=2),
-            device.xep.get_decimation_factor,
+            lambda: device.xep.get_decimation_factor(),
             lambda: device.xep.set_number_format(1),
             lambda: device.xep.set_number_format(value=1),
-            device.xep.get_number_format,
+            lambda: device.xep.get_number_format(),
             lambda: device.xep.set_legacy_output(1),
             lambda: device.xep.set_legacy_output(value=1),
-            device.xep.get_legacy_output,
+            lambda: device.xep.get_legacy_output(),
             lambda: device.unsafe.registers.x4driver_write_to_i2c_register(0, b"\x00"),
             lambda: device.unsafe.registers.x4driver_read_from_i2c_register(1),
         ]
@@ -290,9 +363,25 @@ def test_all_unsupported_apis_transmit_nothing(device_port: str) -> None:
                 call()
             assert device.statistics().bytes_transmitted == transmitted
 
+        invalid_calls: list[Callable[[], object]] = [
+            lambda: device.module.set_baudrate(9600),
+            lambda: device.profile.set_sensitivity(-1),
+            lambda: device.profile.set_tx_center_frequency(2),
+            lambda: device.gpio.get_iopin_control(-1),
+            lambda: device.gpio.set_iopin_control(1, 0x10, 0),
+            lambda: device.filesystem.get_file_data(0, 0, -1, 0),
+        ]
+        for call in invalid_calls:
+            transmitted = device.statistics().bytes_transmitted
+            with pytest.raises(ValueError):
+                call()
+            assert device.statistics().bytes_transmitted == transmitted
+        assert device.filesystem.get_file_data(0, 0, 0, 0) == b""
+        with pytest.raises(AttributeError):
+            _ = device.unsafe.not_an_api  # pyright: ignore[reportAttributeAccessIssue]
+
 
 @pytest.mark.hardware
-@pytest.mark.stateful
 @pytest.mark.unsafe
 def test_unsafe_operations_stop_before_destructive_tx(
     device_port: str, monkeypatch: pytest.MonkeyPatch
@@ -309,7 +398,16 @@ def test_unsafe_operations_stop_before_destructive_tx(
     )
     for gate in gates:
         monkeypatch.delenv(gate, raising=False)
+    unopened = X4M200(port=device_port)
+    monkeypatch.setenv("MXS_ENABLE_BOOTLOADER", "1")
+    with pytest.raises(InvalidDeviceStateError, match="requires state"):
+        unopened.unsafe.start_bootloader(key=0)
+    monkeypatch.delenv("MXS_ENABLE_BOOTLOADER")
     with X4M200(port=device_port) as device:
+        monkeypatch.setenv("MXS_ENABLE_FACTORY_RESET", "1")
+        with pytest.raises(ValueError, match="confirmation"):
+            device.unsafe.reset_to_factory_preset(confirm=False)
+        monkeypatch.delenv("MXS_ENABLE_FACTORY_RESET")
         calls: list[Callable[[], object]] = [
             lambda: device.unsafe.start_bootloader(key=0),
             lambda: device.unsafe.reset_to_factory_preset(confirm=True),
@@ -328,8 +426,8 @@ def test_unsafe_operations_stop_before_destructive_tx(
             lambda: device.unsafe.filesystem_admin.delete_file(0, 0),
             lambda: device.unsafe.filesystem_admin.format_filesystem(key=1),
             lambda: device.unsafe.filesystem_admin.set_file(0, 0, b""),
-            device.noisemap.store_noisemap,
-            device.noisemap.delete_noisemap,
+            lambda: device.noisemap.store_noisemap(),
+            lambda: device.noisemap.delete_noisemap(),
         ]
         for call in calls:
             transmitted = device.statistics().bytes_transmitted

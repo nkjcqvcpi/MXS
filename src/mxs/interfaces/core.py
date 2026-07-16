@@ -2,7 +2,6 @@
 
 import os
 import struct
-import time
 from collections.abc import Generator
 from contextlib import contextmanager, suppress
 from typing import ClassVar, Never
@@ -138,7 +137,7 @@ class Interface:
         result = self._reply(
             "unsafe_get_sensor_mode",
             build_get_sensor_mode(),
-            reply(ByteReply, content_ids={0, 0x26}, element_count=1),
+            reply(ByteReply, content_ids={0}, element_count=1),
         )
         assert isinstance(result, ByteReply)
         sensor_mode = SensorMode(result.values[0])
@@ -171,6 +170,32 @@ class Interface:
             yield
 
 
+def _reset_reconnect_profile_zero(session: DeviceSession, command_name: str) -> None:
+    """Execute reset, reconnect at either baudrate, and require a healthy profile-0 device."""
+    session.execute(command_name, build_module_reset(), ACK)
+    session.invalidate_output_state()
+    session.reconnect_after_reset(delay=0.6, timeout=4.0)
+    pong = session.execute("reset_ping", build_ping(), PONG)
+    if not isinstance(pong, Pong) or not pong.ready:
+        raise ProtocolError("reset reconnect did not return a ready PING")
+    profile = session.execute(
+        "reset_get_profileid",
+        build_filesystem(0x74),
+        reply(IntReply, content_ids={0}, element_count=1),
+    )
+    if not isinstance(profile, IntReply) or int(profile.values[0]) != 0:
+        actual = None if not isinstance(profile, IntReply) else int(profile.values[0])
+        raise ProtocolError(f"reset reconnect did not restore profile ID 0: got {actual!r}")
+    session.execute("reset_stop", build_set_sensor_mode(SensorMode.STOP), ACK)
+    mode = session.execute(
+        "reset_verify_stop",
+        build_get_sensor_mode(),
+        reply(ByteReply, content_ids={0}, element_count=1),
+    )
+    if not isinstance(mode, ByteReply) or SensorMode(mode.values[0]) is not SensorMode.STOP:
+        raise ProtocolError("reset reconnect did not verify STOP mode")
+
+
 class ModuleInterface(Interface):
     def set_debug_level(self, level: int) -> None:
         self._ack("set_debug_level", build_debug_level(level))
@@ -197,7 +222,7 @@ class ModuleInterface(Interface):
         result = self._reply(
             "get_system_info",
             build_system_info(code),
-            reply(StringReply, content_ids={0, 0x58}, info=code),
+            reply(StringReply, content_ids={0x58}, info=code),
         )
         assert isinstance(result, StringReply)
         return result.value
@@ -209,9 +234,7 @@ class ModuleInterface(Interface):
 
     def reset(self) -> None:
         with self._session.operation_lock:
-            self.module_reset()
-            self._session.close_passive()
-            self._session.open()
+            _reset_reconnect_profile_zero(self._session, "module_reset")
 
 
 class ProfileInterface(Interface):
@@ -223,19 +246,18 @@ class ProfileInterface(Interface):
     def restore_profile(self, profile_id: int) -> None:
         """Restore a profile, using reset as the source-backed no-profile operation."""
         with self._session.operation_lock:
-            self.set_sensor_mode(SensorMode.STOP)
             actual = self.get_profileid()
             if profile_id == 0 and actual != 0:
                 # X4M200.hpp defines zero only as the observed no-profile state. It does not
                 # document load_profile(0). Its reset() contract explicitly reconnects after
                 # unloading the application, so use that authoritative path and verify it.
-                self._ack("restore_no_profile", build_module_reset())
-                self._session.close_passive()
-                time.sleep(0.2)
-                self._session.open()
                 self.set_sensor_mode(SensorMode.STOP)
+                _reset_reconnect_profile_zero(self._session, "restore_no_profile")
             elif profile_id != 0 and actual != profile_id:
+                self.set_sensor_mode(SensorMode.STOP)
                 self.load_profile(profile_id)
+                self.set_sensor_mode(SensorMode.STOP)
+            else:
                 self.set_sensor_mode(SensorMode.STOP)
             actual = self.get_profileid()
             if actual != profile_id:
@@ -251,7 +273,7 @@ class ProfileInterface(Interface):
         result = self._reply(
             "get_sensor_mode",
             build_get_sensor_mode(),
-            reply(ByteReply, content_ids={0, 0x26}, element_count=1),
+            reply(ByteReply, content_ids={0}, element_count=1),
         )
         assert isinstance(result, ByteReply)
         return SensorMode(result.values[0])
@@ -260,7 +282,7 @@ class ProfileInterface(Interface):
         result = self._reply(
             "get_profileid",
             build_filesystem(0x74),
-            reply(IntReply, content_ids={0, 0x74}, element_count=1),
+            reply(IntReply, content_ids={0}, element_count=1),
         )
         assert isinstance(result, IntReply)
         return int(result.values[0])
@@ -277,7 +299,7 @@ class ProfileInterface(Interface):
         result = self._reply(
             "get_sensitivity",
             build_app_get(CONTENT_ID_SENSITIVITY),
-            reply(IntReply, content_ids={0, CONTENT_ID_SENSITIVITY}, element_count=1),
+            reply(IntReply, content_ids={0}, element_count=1),
         )
         assert isinstance(result, IntReply)
         return int(result.values[0])
@@ -294,7 +316,7 @@ class ProfileInterface(Interface):
         result = self._reply(
             "get_tx_center_frequency",
             build_app_get(CONTENT_ID_TX_CENTER_FREQUENCY),
-            reply(IntReply, content_ids={0, CONTENT_ID_TX_CENTER_FREQUENCY}, element_count=1),
+            reply(IntReply, content_ids={0}, element_count=1),
         )
         assert isinstance(result, IntReply)
         return int(result.values[0])
@@ -306,7 +328,7 @@ class ProfileInterface(Interface):
         result = self._reply(
             "get_detection_zone",
             build_app_get(CONTENT_ID_DETECTION_ZONE),
-            reply(FloatReply, content_ids={0, CONTENT_ID_DETECTION_ZONE}, element_count=2),
+            reply(FloatReply, content_ids={0}, element_count=2),
         )
         assert isinstance(result, FloatReply)
         return DetectionZone(float(result.values[0]), float(result.values[1]))
@@ -315,7 +337,7 @@ class ProfileInterface(Interface):
         result = self._reply(
             "get_detection_zone_limits",
             build_app_get(CONTENT_ID_DETECTION_ZONE_LIMITS),
-            reply(FloatReply, content_ids={0, CONTENT_ID_DETECTION_ZONE_LIMITS}, element_count=3),
+            reply(FloatReply, content_ids={0}, element_count=3),
         )
         assert isinstance(result, FloatReply)
         return DetectionZoneLimits(*(float(value) for value in result.values))
@@ -327,7 +349,7 @@ class ProfileInterface(Interface):
         result = self._reply(
             "get_led_control",
             build_app_get(CONTENT_ID_LED_CONTROL),
-            reply(ByteReply, content_ids={0, CONTENT_ID_LED_CONTROL}, element_count=1),
+            reply(ByteReply, content_ids={0}, element_count=1),
         )
         assert isinstance(result, ByteReply)
         return result.values[0]
@@ -350,7 +372,7 @@ class OutputsInterface(Interface):
         result = self._reply(
             "get_debug_output_control" if debug else "get_output_control",
             build_get_output_control(feature, debug=debug),
-            reply(IntReply, content_ids={0, feature}, element_count=1),
+            reply(IntReply, content_ids={0}, element_count=1),
         )
         assert isinstance(result, IntReply)
         value = int(result.values[0])
@@ -439,7 +461,7 @@ class XepInterface(Interface):
         result = self._reply(
             f"x4driver_get_{parameter_id:02x}",
             build_x4_get(parameter_id),
-            reply(cls, content_ids={0, parameter_id}, element_count=count),
+            reply(cls, content_ids={parameter_id}, element_count=count),
         )
         if isinstance(result, ByteReply):
             return result.values[0] if count == 1 else result.values
@@ -592,7 +614,7 @@ class GpioInterface(Interface):
         result = self._reply(
             "get_iopin_control",
             build_get_iopin_control(self._pin(pin)),
-            reply(IntReply, content_ids={0, self._pin(pin)}, element_count=2),
+            reply(IntReply, content_ids={0}, element_count=2),
         )
         assert isinstance(result, IntReply)
         return IoPinSetup(int(result.values[0])), IoPinFeature(int(result.values[1]))
@@ -606,7 +628,7 @@ class GpioInterface(Interface):
         result = self._reply(
             "get_iopin_value",
             build_get_iopin_value(self._pin(pin)),
-            reply(IntReply, content_ids={0, 0x21, self._pin(pin)}, element_count=1),
+            reply(IntReply, content_ids={0x21}, element_count=1),
         )
         assert isinstance(result, IntReply)
         return int(result.values[0])
@@ -637,7 +659,7 @@ class NoisemapInterface(Interface):
         result = self._reply(
             "get_noisemap_control",
             build_noisemap(0x11),
-            reply(IntReply, content_ids={0, 0x11}, element_count=1),
+            reply(IntReply, content_ids={0}, element_count=1),
         )
         assert isinstance(result, IntReply)
         return int(result.values[0])
@@ -658,7 +680,7 @@ class ParametersInterface(Interface):
         result = self._reply(
             "get_parameter_file",
             build_parameter_file(filename),
-            reply(ByteReply, content_ids={0, 0x32BA7623}),
+            reply(ByteReply, content_ids={0}),
         )
         assert isinstance(result, ByteReply)
         return result.values
@@ -683,7 +705,7 @@ class FilesystemInterface(Interface):
         result = self._reply(
             "search_for_file_by_type",
             build_filesystem(0x64, file_type),
-            reply(IntReply, content_ids={0, 0x64}),
+            reply(IntReply, content_ids={0}),
         )
         assert isinstance(result, IntReply)
         return [FileIdentifier(file_type, int(value)) for value in result.values]
@@ -694,7 +716,7 @@ class FilesystemInterface(Interface):
 
     def _find_all_files_unlocked(self) -> list[FileIdentifier]:
         result = self._reply(
-            "find_all_files", build_filesystem(0x65), reply(IntReply, content_ids={0, 0x65})
+            "find_all_files", build_filesystem(0x65), reply(IntReply, content_ids={0})
         )
         assert isinstance(result, IntReply)
         count = result.element_count // 2
@@ -711,7 +733,7 @@ class FilesystemInterface(Interface):
         result = self._reply(
             "get_file_length",
             build_filesystem(0x69, file_type, identifier),
-            reply(IntReply, content_ids={0, 0x69}, element_count=1),
+            reply(IntReply, content_ids={0}, element_count=1),
         )
         assert isinstance(result, IntReply)
         return int(result.values[0])
@@ -731,7 +753,7 @@ class FilesystemInterface(Interface):
             reply_value = self._reply(
                 "get_file_data",
                 build_filesystem(0x71, file_type, identifier, position, count),
-                reply(ByteReply, content_ids={0, 0x71}, element_count=count),
+                reply(ByteReply, content_ids={0}, element_count=count),
             )
             assert isinstance(reply_value, ByteReply)
             result.extend(reply_value.values)
@@ -775,7 +797,7 @@ class UnsafeInterface(Interface):
             result = self._reply(
                 "system_run_test",
                 build_system_test(test_code),
-                reply(ByteReply, content_ids={0, 0x5090}),
+                reply(ByteReply, content_ids={0x5090}),
             )
             assert isinstance(result, ByteReply)
             return result.values
@@ -830,7 +852,7 @@ class RegisterInterface(Interface):
             build_x4_get(X4Parameter.SPI_REGISTER, bytes((address,))),
             reply(
                 ByteReply,
-                content_ids={0, int(X4Parameter.SPI_REGISTER)},
+                content_ids={int(X4Parameter.SPI_REGISTER)},
                 element_count=1,
             ),
         )
@@ -859,7 +881,7 @@ class RegisterInterface(Interface):
         result = self._reply(
             f"get_{parameter.name.lower()}",
             build_x4_get(parameter, bytes((address,))),
-            reply(ByteReply, content_ids={0, int(parameter)}, element_count=1),
+            reply(ByteReply, content_ids={int(parameter)}, element_count=1),
         )
         assert isinstance(result, ByteReply)
         return result.values[0]
@@ -886,7 +908,7 @@ class RegisterInterface(Interface):
             build_x4_read(X4Parameter.SPI_REGISTER, bytes((address,)) + struct.pack("<I", length)),
             reply(
                 ByteReply,
-                content_ids={0, int(X4Parameter.SPI_REGISTER)},
+                content_ids={int(X4Parameter.SPI_REGISTER)},
                 element_count=length,
             ),
         )

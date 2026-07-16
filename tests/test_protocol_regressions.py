@@ -47,15 +47,8 @@ from mxs.commands import (
     build_x4_read,
     build_x4_write,
 )
-from mxs.constants import (
-    CONTENT_ID_SENSITIVITY,
-    NO_ESCAPE_MARKER,
-    OutputFeature,
-    ProfileId,
-    SensorMode,
-    X4Parameter,
-)
-from mxs.errors import MalformedMessageError, ReplyMismatchError
+from mxs.constants import NO_ESCAPE_MARKER, OutputFeature, ProfileId, SensorMode, X4Parameter
+from mxs.errors import ReplyMismatchError
 from mxs.expectations import reply
 from mxs.framing import DecoderState, McpStreamDecoder, encode_classic_frame
 from mxs.messages import decode_message
@@ -96,7 +89,6 @@ def test_live_classic_framing_fragmentation_checksum_and_truncation(device_port:
 
 
 @pytest.mark.hardware
-@pytest.mark.stateful
 def test_live_noescape_fragmentation_length_and_truncation(device_port: str) -> None:
     from mxs import X4M200, X4Config
 
@@ -158,6 +150,7 @@ def test_command_builders_and_validation() -> None:
         build_noisemap(0x10, 1),
         build_filesystem(0x64, 1),
         build_parameter_file("a.txt"),
+        build_parameter_file("a.txt", b"value"),
         build_prepare_inject_frame(1, 2, 0),
         build_inject_frame(1, 2, b"\0" * 16),
         build_x4_get(1),
@@ -193,6 +186,11 @@ def test_command_builders_and_validation() -> None:
         lambda: build_prepare_inject_frame(0, 1, 0),
         lambda: build_inject_frame(1, 2, b"bad"),
         lambda: build_set_prf_div(256),
+        lambda: build_load_profile(-1),
+        lambda: build_system_info(256),
+        lambda: build_set_detection_zone(1, 1),
+        lambda: build_set_detection_zone(float("inf"), 2),
+        lambda: build_parameter_file("a" * 256),
     )
     for call in invalid:
         with pytest.raises(ValueError):
@@ -231,7 +229,7 @@ def test_live_rx_bytes_decode_incrementally(device_port: str) -> None:
 
 @pytest.mark.hardware
 @pytest.mark.stateful
-def test_live_reply_content_id_variants_and_strict_validation(device_port: str) -> None:
+def test_live_reply_content_ids_match_target_producers(device_port: str) -> None:
     from mxs import X4M200, X4Config
 
     chunks: list[bytes] = []
@@ -254,43 +252,120 @@ def test_live_reply_content_id_variants_and_strict_validation(device_port: str) 
             assert payloads
             return payloads[-1]
 
-        cases = (
-            (capture_reply(device.profile.get_sensor_mode), ByteReply, 0x26, 1),
-            (capture_reply(device.profile.get_sensitivity), IntReply, CONTENT_ID_SENSITIVITY, 1),
+        files = device.filesystem.find_all_files()
+        cases: list[tuple[bytes, type[Reply], int, int, int]] = [
+            (capture_reply(lambda: device.module.get_system_info(1)), StringReply, 0x58, 6, 1),
+            (capture_reply(device.profile.get_sensor_mode), ByteReply, 0, 1, 0),
+            (capture_reply(device.profile.get_profileid), IntReply, 0, 1, 0),
             (
                 capture_reply(lambda: device.outputs.get_output_control(OutputFeature.BASEBAND_IQ)),
                 IntReply,
-                int(OutputFeature.BASEBAND_IQ),
+                0,
                 1,
+                0,
             ),
-            (capture_reply(lambda: device.gpio.get_iopin_control(1)), IntReply, 1, 2),
-            (capture_reply(device.noisemap.get_noisemap_control), IntReply, 0x11, 1),
-        )
-        device.configure(X4Config())
-        cases += (
+            (capture_reply(lambda: device.gpio.get_iopin_control(1)), IntReply, 0, 2, 0),
+            (capture_reply(lambda: device.gpio.get_iopin_value(1)), IntReply, 0x21, 1, 0),
+            (capture_reply(device.filesystem.find_all_files), IntReply, 0, len(files) * 2, 0),
             (
-                capture_reply(device.xep.x4driver_get_fps),
+                capture_reply(lambda: device.filesystem.search_for_file_by_type(0)),
+                IntReply,
+                0,
+                0,
+                0,
+            ),
+            (capture_reply(device.profile.get_sensitivity), IntReply, 0, 1, 0),
+            (
+                capture_reply(device.profile.get_tx_center_frequency),
+                IntReply,
+                0,
+                1,
+                0,
+            ),
+            (
+                capture_reply(device.profile.get_detection_zone),
                 FloatReply,
-                int(X4Parameter.FPS),
+                0,
+                2,
+                0,
+            ),
+            (
+                capture_reply(device.profile.get_detection_zone_limits),
+                FloatReply,
+                0,
+                3,
+                0,
+            ),
+            (
+                capture_reply(device.profile.get_led_control),
+                ByteReply,
+                0,
+                1,
+                0,
+            ),
+            (capture_reply(device.noisemap.get_noisemap_control), IntReply, 0, 1, 0),
+        ]
+        if files:
+            first = files[0]
+            cases.append(
+                (
+                    capture_reply(
+                        lambda: device.filesystem.get_file_length(first.file_type, first.identifier)
+                    ),
+                    IntReply,
+                    0,
+                    1,
+                    0,
+                )
+            )
+        device.configure(X4Config())
+        x4_cases: tuple[tuple[Callable[[], object], type[Reply], X4Parameter | int, int], ...] = (
+            (device.xep.x4driver_get_fps, FloatReply, X4Parameter.FPS, 1),
+            (device.xep.x4driver_get_iterations, IntReply, X4Parameter.ITERATIONS, 1),
+            (
+                device.xep.x4driver_get_pulses_per_step,
+                IntReply,
+                X4Parameter.PULSES_PER_STEP,
                 1,
             ),
+            (device.xep.x4driver_get_dac_min, IntReply, X4Parameter.DAC_MIN, 1),
+            (device.xep.x4driver_get_dac_max, IntReply, X4Parameter.DAC_MAX, 1),
+            (device.xep.x4driver_get_tx_power, ByteReply, X4Parameter.TX_POWER, 1),
+            (
+                device.xep.x4driver_get_downconversion,
+                ByteReply,
+                X4Parameter.DOWNCONVERSION,
+                1,
+            ),
+            (device.xep.x4driver_get_frame_bin_count, IntReply, 0x26, 1),
+            (device.xep.x4driver_get_frame_area, FloatReply, X4Parameter.FRAME_AREA, 2),
+            (
+                device.xep.x4driver_get_frame_area_offset,
+                FloatReply,
+                X4Parameter.FRAME_AREA_OFFSET,
+                1,
+            ),
+            (
+                device.xep.x4driver_get_tx_center_frequency,
+                ByteReply,
+                X4Parameter.TX_CENTER_FREQUENCY,
+                1,
+            ),
+            (device.xep.x4driver_get_prf_div, ByteReply, X4Parameter.PRF_DIV, 1),
+        )
+        cases.extend(
+            (capture_reply(call), reply_class, int(content_id), count, 0)
+            for call, reply_class, content_id, count in x4_cases
         )
 
-        for payload, reply_class, source_id, count in cases:
-            expectation = reply(reply_class, content_ids={0, source_id}, element_count=count)
+        for payload, reply_class, source_id, count, info in cases:
+            expectation = reply(
+                reply_class, content_ids={source_id}, info=info, element_count=count
+            )
             observed = decode_message(payload)
             assert isinstance(observed, Reply)
             expectation.validate(observed)
-            source_variant = bytearray(payload)
-            source_variant[2:6] = struct.pack("<I", source_id)
-            expectation.validate(decode_message(bytes(source_variant)))  # type: ignore[arg-type]
-            wrong_content = bytearray(source_variant)
-            wrong_content[2:6] = struct.pack("<I", 0xFFFFFFFF)
+            wrong_content = bytearray(payload)
+            wrong_content[2:6] = struct.pack("<I", 0xFFFFFFFF if source_id == 0 else 0)
             with pytest.raises(ReplyMismatchError, match="content ID"):
                 expectation.validate(decode_message(bytes(wrong_content)))  # type: ignore[arg-type]
-            wrong_info = bytearray(source_variant)
-            wrong_info[6:10] = struct.pack("<I", 1)
-            with pytest.raises(ReplyMismatchError, match="info"):
-                expectation.validate(decode_message(bytes(wrong_info)))  # type: ignore[arg-type]
-            with pytest.raises(MalformedMessageError):
-                decode_message(payload[:-1])

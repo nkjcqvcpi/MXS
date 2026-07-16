@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.6 - 2026-07-16
+
+- Use the source-defined 500 ms reset delay with a 600 ms host wait, bounded reopen retries, both baud probes, PING, profile-0, and STOP verification shared by module reset and profile restoration.
+- Make baud-candidate acceptance atomic behind the RX submission barrier and defer user callbacks until the session is `OPEN`, permitting callback API re-entry without deadlock.
+- Restrict every reply expectation to the content ID emitted by its Legacy target producer and confirmed live behavior; remove request-derived and speculative alternatives.
+- Remove complete fabricated firmware messages from tests. Decoder and framing checks now begin with real packets and apply minimal mutations only.
+- Execute the parameter-file and four register getters in separate sessions, recording the ACK mismatch or exact returned values independently.
+- Capture and verify supported normal and debug output baselines, including typed unsupported namespaces, during preflight and teardown.
+- Strengthen API-parity auditing to require direct calls for execution evidence and transmitted-byte assertions for unsupported APIs.
+- Keep `uv.lock` local and ignored; validate with `uv sync` and record exact resolved versions using `uv pip freeze`.
+
 ## 0.2.5 - 2026-07-16
 
 - Add an explicit `OPENING` state and prevent asynchronous serial, decoder, callback, recorder, or worker-termination failures from being overwritten by `OPEN`.
@@ -7,7 +18,7 @@
 - Accept both source-defined and observed Annapurna 1.6.6 reply content IDs while retaining strict datatype, info, element-count, element-size, and payload-length validation.
 - Enforce all three output-exclusivity pairs through one normal/debug transaction with preflight conflict rejection and postcondition verification.
 - Restore baseline profile ID `0` through verified no-profile state or source-backed module reset, then verify outputs, STOP, 115200 baud, PING, and worker shutdown.
-- Replace synthetic firmware, fake router, and fake discovery tests with mutations of packets captured from the connected X4M200.
+- Move framing and several reply tests to packets captured from the connected X4M200; complete fabricated payload cases remained until their removal in 0.2.6.
 - Require explicit method-level API-parity evidence and verify that each cited pytest node directly references its documented API symbol.
 - Give every unsupported method an explicit documented signature and verify positional and keyword calls raise `UnsupportedFirmwareError` without transmission.
 

@@ -97,7 +97,7 @@ class DeviceSession:
         with self.operation_lock:
             self._open_locked()
 
-    def _open_locked(self) -> None:
+    def _open_locked(self, *, deadline: float | None = None) -> None:
         self._require(DeviceState.CLOSED)
         self.invalidate_output_state()
         candidates = (
@@ -107,6 +107,9 @@ class DeviceSession:
         )
         failures: list[str] = []
         for baudrate in candidates:
+            if deadline is not None and time.monotonic() >= deadline:
+                failures.append("reconnect deadline expired")
+                break
             with suppress(BaseException):
                 self.router.close()
             self._build_runtime()
@@ -116,16 +119,23 @@ class DeviceSession:
                 self.worker = worker
                 self._transition(DeviceState.OPENING)
             try:
-                self._probe_candidate(worker)
-                worker.flush_callbacks(self.command_timeout)
-                worker.raise_if_failed()
-                with self._candidate_failure_lock:
-                    if self._candidate_fatal_error is not None:
-                        raise self._candidate_fatal_error
-                    worker.raise_if_failed()
-                    self.detected_baudrate = baudrate
-                    self._transition(DeviceState.OPEN)
-                    self._reprobe_all_baudrates = False
+                self._probe_candidate(worker, deadline=deadline)
+
+                def accept(worker: SerialWorker = worker, baudrate: int = baudrate) -> None:
+                    with self._candidate_failure_lock:
+                        if self._candidate_fatal_error is not None:
+                            raise self._candidate_fatal_error
+                        worker.raise_if_failed()
+                        self.detected_baudrate = baudrate
+                        self._transition(DeviceState.OPEN)
+                        self._reprobe_all_baudrates = False
+
+                acceptance_timeout = self.command_timeout
+                if deadline is not None:
+                    acceptance_timeout = min(
+                        acceptance_timeout, max(0.05, deadline - time.monotonic())
+                    )
+                worker.accept_candidate(acceptance_timeout, accept)
                 LOGGER.info("detected %d baud", baudrate)
                 return
             except BaseException as error:
@@ -145,20 +155,44 @@ class DeviceSession:
             wire_chunk_callback=self.wire_chunk_callback,
         )
 
-    def _probe_candidate(self, worker: SerialWorker) -> None:
+    def _probe_candidate(self, worker: SerialWorker, *, deadline: float | None = None) -> None:
         baseline = self.router.valid_packet_count
         worker.start()
-        deadline = time.monotonic() + (0.7 if self.requested_baudrate == "auto" else 0.1)
-        while time.monotonic() < deadline and self.router.valid_packet_count == baseline:
+        passive_deadline = time.monotonic() + (0.7 if self.requested_baudrate == "auto" else 0.1)
+        if deadline is not None:
+            passive_deadline = min(passive_deadline, deadline)
+        while time.monotonic() < passive_deadline and self.router.valid_packet_count == baseline:
             time.sleep(0.01)
         if self.router.valid_packet_count == baseline:
+            timeout = self.command_timeout
+            if deadline is not None:
+                timeout = min(timeout, max(0.05, deadline - time.monotonic()))
             self.command_manager.execute(
                 "PING",
                 build_ping(),
                 worker.send,
-                self.command_timeout,
+                timeout,
                 expect_pong=True,
             )
+
+    def reconnect_after_reset(self, *, delay: float = 0.6, timeout: float = 4.0) -> None:
+        """Passively close, wait for firmware reset, and reprobe both supported baudrates."""
+        with self.operation_lock:
+            self._close_locked(passive=True)
+            time.sleep(delay)
+            deadline = time.monotonic() + timeout
+            self._reprobe_all_baudrates = True
+            failures: list[str] = []
+            while time.monotonic() < deadline:
+                try:
+                    self._open_locked(deadline=deadline)
+                    return
+                except BaudDetectionError as error:
+                    failures.append(str(error))
+                    if time.monotonic() < deadline:
+                        time.sleep(min(0.05, deadline - time.monotonic()))
+            detail = "; ".join(failures) or "device did not reappear"
+            raise BaudDetectionError(f"reset reconnect failed within {timeout:.1f}s: {detail}")
 
     def _close_candidate(self, worker: SerialWorker) -> BaseException | None:
         cleanup_error: BaseException | None = None

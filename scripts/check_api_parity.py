@@ -213,26 +213,47 @@ def pytest_node_exists(node: str) -> bool:
     )
 
 
-def pytest_node_references(node: str, api: str) -> bool:
+def pytest_node_tree(node: str) -> ast.FunctionDef | ast.AsyncFunctionDef:
     path, symbol = node.split("::")
     tree = ast.parse((ROOT / path).read_text(encoding="utf-8"), filename=path)
-    function = next(
+    return next(
         item
         for item in tree.body
         if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == symbol
     )
 
-    def attribute_path(value: ast.AST) -> str | None:
-        parts: list[str] = []
-        while isinstance(value, ast.Attribute):
-            parts.append(value.attr)
-            value = value.value
-        if isinstance(value, ast.Name):
-            parts.append(value.id)
-            return ".".join(reversed(parts))
-        return None
 
+def attribute_path(value: ast.AST) -> str | None:
+    parts: list[str] = []
+    while isinstance(value, ast.Attribute):
+        parts.append(value.attr)
+        value = value.value
+    if isinstance(value, ast.Name):
+        parts.append(value.id)
+        return ".".join(reversed(parts))
+    return None
+
+
+def pytest_node_references(node: str, api: str) -> bool:
+    function = pytest_node_tree(node)
     return any(attribute_path(item) == api for item in ast.walk(function))
+
+
+def pytest_node_calls(node: str, api: str) -> bool:
+    function = pytest_node_tree(node)
+    return any(
+        isinstance(item, ast.Call) and attribute_path(item.func) == api
+        for item in ast.walk(function)
+    )
+
+
+def pytest_node_asserts_no_tx(node: str) -> bool:
+    function = pytest_node_tree(node)
+    transmitted_reads = sum(
+        attribute_path(item) == "device.statistics" for item in ast.walk(function)
+    )
+    source = ast.unparse(function)
+    return transmitted_reads >= 2 and "bytes_transmitted" in source
 
 
 def audit() -> list[str]:
@@ -266,16 +287,32 @@ def audit() -> list[str]:
                 "not-executed-with-reason",
             }:
                 problems.append(f"{interface}.{method}: invalid evidence type {evidence_type!r}")
+            if not reason:
+                problems.append(f"{interface}.{method}: missing specific outcome or reason")
             if not pytest_node_exists(node):
                 problems.append(f"{interface}.{method}: nonexistent pytest node {node!r}")
             elif not pytest_node_references(node, path):
                 problems.append(
                     f"{interface}.{method}: pytest node does not directly reference {path!r}"
                 )
+            elif (
+                evidence_type
+                in {
+                    "executed-safe",
+                    "executed-typed-rejection",
+                    "unsupported-no-tx",
+                    "unsafe-guard-only",
+                }
+                and path != "device.messages"
+                and not pytest_node_calls(node, path)
+            ):
+                problems.append(f"{interface}.{method}: execution evidence does not call {path!r}")
             if evidence_type == "not-executed-with-reason" and not reason:
                 problems.append(f"{interface}.{method}: missing non-execution reason")
             if method in UNSUPPORTED and evidence_type != "unsupported-no-tx":
                 problems.append(f"{interface}.{method}: unsupported API lacks no-TX evidence")
+            if method in UNSUPPORTED and not pytest_node_asserts_no_tx(node):
+                problems.append(f"{interface}.{method}: no transmitted-byte assertion")
             if method in UNSAFE and evidence_type != "unsafe-guard-only":
                 problems.append(f"{interface}.{method}: destructive API falsely marked executed")
             if path == "device.messages":

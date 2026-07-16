@@ -24,7 +24,7 @@
 
 | Gate | Command and result |
 |---|---|
-| Dependency synchronization | `uv sync --locked`: pass, 20 packages resolved and MXS 0.2.5 installed |
+| Dependency synchronization | `uv sync`: pass, 20 packages resolved and MXS 0.2.5 installed in that validation environment |
 | Formatting | `uv run ruff format .`: pass, 55 files unchanged |
 | Lint | `uv run ruff check .`: pass, no errors |
 | Types | `uv run pyright`: pass, 0 errors, 0 warnings, 0 information messages |

@@ -14,6 +14,7 @@ import pytest
 
 from mxs import X4M200
 from mxs.constants import OutputControl, OutputFeature, SensorMode, SystemInfoCode
+from mxs.errors import CommandRejectedError, UnsupportedFirmwareError
 
 DEVICE_PORT = "/dev/tty.usbmodem2101"
 SUPPORTED_OUTPUTS = tuple(
@@ -40,6 +41,23 @@ class DeviceBaseline:
     sensor_mode: SensorMode
     profile_id: int
     outputs: dict[OutputFeature, int]
+    debug_outputs: dict[OutputFeature, int]
+    debug_rejections: dict[OutputFeature, str]
+
+
+def _capture_debug_outputs(
+    device: X4M200,
+) -> tuple[dict[OutputFeature, int], dict[OutputFeature, str]]:
+    supported: dict[OutputFeature, int] = {}
+    rejected: dict[OutputFeature, str] = {}
+    for feature in OutputFeature:
+        try:
+            supported[feature] = device.outputs.get_debug_output_control(feature)
+        except (CommandRejectedError, UnsupportedFirmwareError) as error:
+            rejected[feature] = type(error).__name__
+    if set(supported) | set(rejected) != set(OutputFeature):
+        raise RuntimeError("debug-output preflight did not classify every namespace")
+    return supported, rejected
 
 
 def _require_character_device(port: str) -> None:
@@ -89,11 +107,14 @@ def _capture_baseline(port: str) -> DeviceBaseline:
         outputs = {
             feature: device.outputs.get_output_control(feature) for feature in SUPPORTED_OUTPUTS
         }
+        debug_outputs, debug_rejections = _capture_debug_outputs(device)
         device.profile.set_sensor_mode(SensorMode.STOP)
         if baudrate != 115200:
             device.module.set_baudrate(115200)
     _assert_no_mxs_threads()
-    return DeviceBaseline(baudrate, sensor_mode, profile_id, outputs)
+    return DeviceBaseline(
+        baudrate, sensor_mode, profile_id, outputs, debug_outputs, debug_rejections
+    )
 
 
 def _restore_device(port: str, baseline: DeviceBaseline) -> None:
@@ -101,18 +122,26 @@ def _restore_device(port: str, baseline: DeviceBaseline) -> None:
     _require_free_port(port)
     with X4M200(port=port, baudrate="auto") as device:
         _identify(device)
-        device.profile.set_sensor_mode(SensorMode.STOP)
-        for feature in SUPPORTED_OUTPUTS:
-            if device.outputs.get_output_control(feature):
-                device.outputs.set_output_control(feature, OutputControl.DISABLE)
         device.profile.restore_profile(baseline.profile_id)
         device.profile.set_sensor_mode(SensorMode.STOP)
-        for feature in SUPPORTED_OUTPUTS:
-            if device.outputs.get_output_control(feature):
+        current_outputs = {
+            feature: device.outputs.get_output_control(feature) for feature in SUPPORTED_OUTPUTS
+        }
+        current_debug_outputs, current_debug_rejections = _capture_debug_outputs(device)
+        if current_debug_rejections != baseline.debug_rejections:
+            raise RuntimeError("X4M200 restoration changed debug-output rejection behavior")
+        for feature, control in current_outputs.items():
+            if control and control != baseline.outputs[feature]:
                 device.outputs.set_output_control(feature, OutputControl.DISABLE)
+        for feature, control in current_debug_outputs.items():
+            if control and control != baseline.debug_outputs[feature]:
+                device.outputs.set_debug_output_control(feature, OutputControl.DISABLE)
         for feature, control in baseline.outputs.items():
-            if control:
+            if control and current_outputs[feature] != control:
                 device.outputs.set_output_control(feature, control)
+        for feature, control in baseline.debug_outputs.items():
+            if control and current_debug_outputs[feature] != control:
+                device.outputs.set_debug_output_control(feature, control)
         if device.detected_baudrate != 115200:
             device.module.set_baudrate(115200)
         if device.profile.get_sensor_mode() is not SensorMode.STOP:
@@ -124,6 +153,11 @@ def _restore_device(port: str, baseline: DeviceBaseline) -> None:
         }
         if actual_outputs != baseline.outputs:
             raise RuntimeError("X4M200 restoration did not restore baseline outputs")
+        actual_debug_outputs, actual_debug_rejections = _capture_debug_outputs(device)
+        if actual_debug_outputs != baseline.debug_outputs:
+            raise RuntimeError("X4M200 restoration did not restore baseline debug outputs")
+        if actual_debug_rejections != baseline.debug_rejections:
+            raise RuntimeError("X4M200 restoration changed debug-output rejection behavior")
         if device.detected_baudrate != 115200:
             raise RuntimeError("X4M200 restoration did not end at 115200 baud")
         if not device.module.ping().ready:

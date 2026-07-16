@@ -1,15 +1,17 @@
 # MXS
 
-MXS 0.2.5 is a modern, unofficial, pure-Python SDK for the Novelda XeThru X4M200. It implements MCP framing, typed replies, raw RF and IQ acquisition, application messages, XEP/X4Driver configuration, bounded message delivery, recording, and optional NumPy/SciPy processing. MXS does not load ModuleConnector, SWIG, CFFI, `ctypes`, Rosetta, or a compiled Novelda library. NumPy and SciPy use their normal optimized distributions.
+MXS 0.2.6 is a modern, unofficial, pure-Python SDK for the Novelda XeThru X4M200. It implements MCP framing, typed replies, raw RF and IQ acquisition, application messages, XEP/X4Driver configuration, bounded message delivery, recording, and optional NumPy/SciPy processing. MXS does not load ModuleConnector, SWIG, CFFI, `ctypes`, Rosetta, or a compiled Novelda library. NumPy and SciPy use their normal optimized distributions.
 
 ## Install
 
 Python 3.14 or newer is required.
 
 ```bash
-uv sync --locked
+uv sync
 uv run mxs ports
 ```
+
+`uv.lock` is intentionally local and ignored. Validation records the environment with `uv pip freeze`; a clean checkout may resolve newer compatible dependency versions.
 
 MXS supports macOS and other platforms on which pySerial can open the module. `X4M200(port=None)` selects one unambiguous XeThru candidate. Pass a device path when more than one candidate is present.
 
@@ -87,6 +89,6 @@ MXS_TEST_PORT=/dev/tty.usbmodem2101 uv run pytest -x --cov=mxs --cov-fail-under=
 uv build
 ```
 
-Pytest requires the real X4M200 at the fixed path. Collection aborts if a test does not depend on the device fixture, and setup aborts if the port is missing, occupied, unidentified, or unresponsive. The suite contains no fake serial device, synthetic firmware response, checked-in traffic capture, or soak test.
+Pytest requires the real X4M200 at the fixed path. Collection aborts if a test does not depend on the device fixture, and setup aborts if the port is missing, occupied, unidentified, or unresponsive. Firmware-response tests begin with packets captured from that device and apply only minimal source-backed mutations. The suite contains no fake serial device, fabricated complete firmware payload, checked-in traffic capture, or soak test.
 
-Protocol provenance is recorded in [source map](docs/source-map.md), [protocol notes](docs/protocol-notes.md), and [upstream sources](docs/upstream-sources.md). Release-specific changes are in [the 0.2.5 migration guide](docs/migration-0.2.4-to-0.2.5.md).
+Protocol provenance is recorded in [source map](docs/source-map.md), [protocol notes](docs/protocol-notes.md), and [upstream sources](docs/upstream-sources.md). Release-specific changes are in [the 0.2.6 migration guide](docs/migration-0.2.5-to-0.2.6.md).

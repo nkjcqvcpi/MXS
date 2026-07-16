@@ -1,5 +1,7 @@
 """Broad safe API validation against the real module."""
 
+from collections.abc import Callable
+
 import pytest
 
 from mxs import X4M200, X4Config
@@ -98,18 +100,18 @@ def test_safe_profile_xep_gpio_noisemap_and_filesystem_surfaces(device_port: str
 @pytest.mark.hardware
 def test_safe_optional_reads_fail_typed_when_firmware_rejects(device_port: str) -> None:
     failures = (CommandRejectedError, CommandTimeoutError, ProtocolError)
-    with X4M200(port=device_port) as device:
-        calls = (
-            lambda: device.parameters.get_parameter_file("profile.par"),
-            lambda: device.unsafe.registers.x4driver_get_spi_register(0),
-            lambda: device.unsafe.registers.x4driver_get_pif_register(0),
-            lambda: device.unsafe.registers.x4driver_get_xif_register(0),
-            lambda: device.unsafe.registers.x4driver_read_from_spi_register(0, 1),
-        )
-        outcomes: list[object] = []
-        for call in calls:
+    operations: tuple[Callable[[X4M200], object], ...] = (
+        lambda device: device.parameters.get_parameter_file("profile.par"),
+        lambda device: device.unsafe.registers.x4driver_get_spi_register(0),
+        lambda device: device.unsafe.registers.x4driver_get_pif_register(0),
+        lambda device: device.unsafe.registers.x4driver_get_xif_register(0),
+        lambda device: device.unsafe.registers.x4driver_read_from_spi_register(0, 1),
+    )
+    outcomes: list[object] = []
+    for operation in operations:
+        with X4M200(port=device_port) as device:
             try:
-                outcomes.append(call())
+                outcomes.append(operation(device))
             except failures as error:
                 outcomes.append(type(error))
-        assert len(outcomes) == len(calls)
+    assert len(outcomes) == len(operations)
