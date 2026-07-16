@@ -1,6 +1,6 @@
 # MXS
 
-MXS is a modern, unofficial, pure-Python SDK for the Novelda XeThru X4M200. It implements MCP framing, typed replies, raw RF and IQ acquisition, application messages, XEP/X4Driver configuration, bounded message delivery, recording, and optional NumPy/SciPy processing. MXS does not load ModuleConnector, SWIG, CFFI, `ctypes`, Rosetta, or a compiled Novelda library. NumPy and SciPy use their normal optimized distributions.
+MXS 0.2.5 is a modern, unofficial, pure-Python SDK for the Novelda XeThru X4M200. It implements MCP framing, typed replies, raw RF and IQ acquisition, application messages, XEP/X4Driver configuration, bounded message delivery, recording, and optional NumPy/SciPy processing. MXS does not load ModuleConnector, SWIG, CFFI, `ctypes`, Rosetta, or a compiled Novelda library. NumPy and SciPy use their normal optimized distributions.
 
 ## Install
 
@@ -71,7 +71,7 @@ Unsafe namespaces require operation-specific environment gates and verify the de
 
 Any command timeout marks the session desynchronized, closes the transport, and rejects further commands. Call `recover()` to reprobe and restore STOP state. A disconnect wakes pending consumers; close and reopen the same object to rebuild workers and subscriptions.
 
-All structured interface commands acquire one reentrant session operation lock. Mutually exclusive IQ/amplitude-phase, pulse-Doppler float/byte, and noisemap float/byte enables are checked against freshly queried firmware state before the requested enable is transmitted.
+All structured interface commands acquire one reentrant session operation lock. Mutually exclusive IQ/amplitude-phase, pulse-Doppler float/byte, and noisemap float/byte enables are checked against the complete freshly queried normal or debug namespace before transmission and verified again after the firmware acknowledges the change.
 
 Firmware-dependent behavior is conservative. Unknown support is never reported as supported, and functions with no local producer or a negative probe raise `UnsupportedFirmwareError`. The tested firmware matrix is in [firmware capabilities](docs/firmware-capabilities.md).
 
@@ -89,4 +89,4 @@ uv build
 
 Pytest requires the real X4M200 at the fixed path. Collection aborts if a test does not depend on the device fixture, and setup aborts if the port is missing, occupied, unidentified, or unresponsive. The suite contains no fake serial device, synthetic firmware response, checked-in traffic capture, or soak test.
 
-Protocol provenance is recorded in [source map](docs/source-map.md), [protocol notes](docs/protocol-notes.md), and [upstream sources](docs/upstream-sources.md). Release-specific changes are in [the 0.2.4 migration guide](docs/migration-0.2.3-to-0.2.4.md).
+Protocol provenance is recorded in [source map](docs/source-map.md), [protocol notes](docs/protocol-notes.md), and [upstream sources](docs/upstream-sources.md). Release-specific changes are in [the 0.2.5 migration guide](docs/migration-0.2.4-to-0.2.5.md).

@@ -105,12 +105,11 @@ def _restore_device(port: str, baseline: DeviceBaseline) -> None:
         for feature in SUPPORTED_OUTPUTS:
             if device.outputs.get_output_control(feature):
                 device.outputs.set_output_control(feature, OutputControl.DISABLE)
-        if baseline.profile_id:
-            device.profile.load_profile(baseline.profile_id)
-            device.profile.set_sensor_mode(SensorMode.STOP)
-            for feature in SUPPORTED_OUTPUTS:
-                if device.outputs.get_output_control(feature):
-                    device.outputs.set_output_control(feature, OutputControl.DISABLE)
+        device.profile.restore_profile(baseline.profile_id)
+        device.profile.set_sensor_mode(SensorMode.STOP)
+        for feature in SUPPORTED_OUTPUTS:
+            if device.outputs.get_output_control(feature):
+                device.outputs.set_output_control(feature, OutputControl.DISABLE)
         for feature, control in baseline.outputs.items():
             if control:
                 device.outputs.set_output_control(feature, control)
@@ -118,6 +117,15 @@ def _restore_device(port: str, baseline: DeviceBaseline) -> None:
             device.module.set_baudrate(115200)
         if device.profile.get_sensor_mode() is not SensorMode.STOP:
             raise RuntimeError("X4M200 restoration did not end in STOP mode")
+        if device.profile.get_profileid() != baseline.profile_id:
+            raise RuntimeError("X4M200 restoration did not restore the baseline profile")
+        actual_outputs = {
+            feature: device.outputs.get_output_control(feature) for feature in SUPPORTED_OUTPUTS
+        }
+        if actual_outputs != baseline.outputs:
+            raise RuntimeError("X4M200 restoration did not restore baseline outputs")
+        if device.detected_baudrate != 115200:
+            raise RuntimeError("X4M200 restoration did not end at 115200 baud")
         if not device.module.ping().ready:
             raise RuntimeError("X4M200 restoration PING failed")
     _assert_no_mxs_threads()

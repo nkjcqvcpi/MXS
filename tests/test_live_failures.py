@@ -3,14 +3,17 @@
 import inspect
 import threading
 from contextlib import suppress
+from typing import Never
 
 import pytest
+import serial
 
 from mxs import X4M200, X4Config
 from mxs.constants import DeviceState, SensorMode
-from mxs.errors import InvalidDeviceStateError, WorkerTerminatedError
+from mxs.errors import BaudDetectionError, InvalidDeviceStateError, WorkerTerminatedError
 from mxs.interfaces.core import Interface
 from mxs.session import DeviceSession
+from mxs.transport import SerialWorker, WireChunk
 
 
 @pytest.mark.hardware
@@ -37,8 +40,79 @@ def test_real_rx_callback_failure_promotes_session_error(device_port: str) -> No
 
 @pytest.mark.hardware
 @pytest.mark.stateful
-@pytest.mark.timeout(15)
-def test_blocked_real_rx_callback_retains_worker_until_cleanup(device_port: str) -> None:
+def test_opening_wire_recorder_failure_is_fatal(device_port: str) -> None:
+    def fail_on_wire(_chunk: WireChunk) -> None:
+        raise RuntimeError("opening wire recorder failure")
+
+    session = DeviceSession(device_port, 115200, wire_chunk_callback=fail_on_wire)
+    with pytest.raises(RuntimeError, match="opening wire recorder failure"):
+        session.open()
+    assert session.state is DeviceState.CLOSED
+    assert session.worker is None
+
+
+@pytest.mark.hardware
+@pytest.mark.stateful
+def test_opening_decoder_failure_is_fatal(
+    device_port: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mxs.transport
+
+    def fail_decode(_payload: bytes) -> Never:
+        raise RuntimeError("opening decoder failure")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(mxs.transport, "decode_message", fail_decode)
+        session = DeviceSession(device_port, 115200)
+        with pytest.raises(RuntimeError, match="opening decoder failure"):
+            session.open()
+    assert session.state is DeviceState.CLOSED
+    assert session.worker is None
+
+
+@pytest.mark.hardware
+@pytest.mark.stateful
+def test_opening_serial_failure_is_fatal(device_port: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    original = SerialWorker._drain_requests  # pyright: ignore[reportPrivateUsage]
+    raised = False
+
+    def fail_after_real_open(self: SerialWorker, port: object) -> None:
+        nonlocal raised
+        if not raised:
+            raised = True
+            raise serial.SerialException("opening serial failure")
+        original(self, port)  # type: ignore[arg-type]
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(SerialWorker, "_drain_requests", fail_after_real_open)
+        session = DeviceSession(device_port, 115200)
+        with pytest.raises(Exception, match="opening serial failure"):
+            session.open()
+    assert raised
+    assert session.state is DeviceState.CLOSED
+    assert session.worker is None
+
+
+@pytest.mark.hardware
+@pytest.mark.stateful
+def test_terminated_serial_worker_cannot_become_open(device_port: str) -> None:
+    session = DeviceSession(device_port, 115200)
+
+    def terminate_on_real_rx(_chunk: bytes) -> None:
+        assert session.worker is not None
+        session.worker._stop.set()  # pyright: ignore[reportPrivateUsage]
+
+    session.raw_chunk_callback = terminate_on_real_rx
+    with pytest.raises(BaudDetectionError, match="termination requested unexpectedly"):
+        session.open()
+    assert session.state is DeviceState.CLOSED
+    assert session.worker is None
+
+
+@pytest.mark.hardware
+@pytest.mark.stateful
+@pytest.mark.timeout(30)
+def test_blocked_opening_callback_retains_worker_until_cleanup(device_port: str) -> None:
     entered = threading.Event()
     release = threading.Event()
 
@@ -47,10 +121,9 @@ def test_blocked_real_rx_callback_retains_worker_until_cleanup(device_port: str)
         assert release.wait(10.0)
 
     session = DeviceSession(device_port, 115200, raw_chunk_callback=block_on_rx)
-    session.open()
-    assert entered.wait(2.0)
     with pytest.raises(WorkerTerminatedError):
-        session.close()
+        session.open()
+    assert entered.is_set()
     assert session.state is DeviceState.ERROR
     assert session.worker is not None and session.worker.owned_workers_alive
     release.set()

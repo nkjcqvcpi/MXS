@@ -62,7 +62,9 @@ class DeviceSession:
         self._reprobe_all_baudrates = False
         self.operation_lock = threading.RLock()
         self.filesystem_lock = self.operation_lock
-        self.output_state_cache: dict[int, int] = {}
+        self.output_state_cache: dict[tuple[bool, int], int] = {}
+        self._candidate_failure_lock = threading.Lock()
+        self._candidate_fatal_error: BaseException | None = None
         self.command_manager: CommandManager
         self.router: MessageRouter
         self.frames: FrameSubscription
@@ -109,12 +111,21 @@ class DeviceSession:
                 self.router.close()
             self._build_runtime()
             worker = self._create_worker(baudrate)
+            with self._candidate_failure_lock:
+                self._candidate_fatal_error = None
+                self.worker = worker
+                self._transition(DeviceState.OPENING)
             try:
                 self._probe_candidate(worker)
-                self.worker = worker
-                self.detected_baudrate = baudrate
-                self._transition(DeviceState.OPEN)
-                self._reprobe_all_baudrates = False
+                worker.flush_callbacks(self.command_timeout)
+                worker.raise_if_failed()
+                with self._candidate_failure_lock:
+                    if self._candidate_fatal_error is not None:
+                        raise self._candidate_fatal_error
+                    worker.raise_if_failed()
+                    self.detected_baudrate = baudrate
+                    self._transition(DeviceState.OPEN)
+                    self._reprobe_all_baudrates = False
                 LOGGER.info("detected %d baud", baudrate)
                 return
             except BaseException as error:
@@ -402,9 +413,12 @@ class DeviceSession:
         self.state = state
 
     def _fatal_error(self, error: BaseException) -> None:
-        if self.state not in (DeviceState.CLOSING, DeviceState.CLOSED):
-            LOGGER.error("device session failed: %s", error)
-            self._transition(DeviceState.ERROR)
+        with self._candidate_failure_lock:
+            if self.state is DeviceState.OPENING and self._candidate_fatal_error is None:
+                self._candidate_fatal_error = error
+            if self.state not in (DeviceState.CLOSING, DeviceState.CLOSED):
+                LOGGER.error("device session failed: %s", error)
+                self._transition(DeviceState.ERROR)
 
     def _desynchronize(self, error: BaseException) -> None:
         LOGGER.error("command timeout desynchronized device session: %s", error)

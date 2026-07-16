@@ -271,12 +271,13 @@ class MessageRouter:
         return subscription
 
     def route(self, message: Message, raw_payload: bytes) -> None:
-        self.valid_packet_count += 1
         self.message_types.add(type(message).__name__)
         if self.command_manager.route(message, raw_payload):
+            self.valid_packet_count += 1
             return
         if isinstance(message, (Ack, ErrorResponse, Reply, Pong)):
             LOGGER.debug("discarding uncorrelated control response %s", type(message).__name__)
+            self.valid_packet_count += 1
             return
         application_counter = getattr(message, "frame_counter", None)
         if isinstance(application_counter, int) and not isinstance(
@@ -327,6 +328,7 @@ class MessageRouter:
                     "system" if type(message).__name__ == "SystemMessage" else "all", message
                 )
             self._bounded_put(self.events, message)
+        self.valid_packet_count += 1
 
     def _publish_frame(
         self,

@@ -76,6 +76,10 @@ class DecoderWorker:
         self.stream: queue.Queue[bytes] = queue.Queue(stream_capacity)
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="mxs-decoder", daemon=False)
+        self._condition = threading.Condition()
+        self._submitted = 0
+        self._completed = 0
+        self._error: BaseException | None = None
 
     def start(self) -> None:
         self._thread.start()
@@ -85,6 +89,7 @@ class DecoderWorker:
         return self._thread.is_alive()
 
     def submit(self, payload: bytes) -> None:
+        self.raise_if_failed()
         control_types = {
             ResponseType.ACK,
             ResponseType.ERROR,
@@ -95,6 +100,8 @@ class DecoderWorker:
         target = self.control if payload and payload[0] in control_types else self.stream
         try:
             target.put_nowait(payload)
+            with self._condition:
+                self._submitted += 1
             self.statistics.maximum(
                 "decoder_control_high_water_mark"
                 if target is self.control
@@ -113,6 +120,29 @@ class DecoderWorker:
         self._thread.join(timeout)
         if self._thread.is_alive():
             raise WorkerTerminatedError("message decoder failed to terminate")
+        self.raise_if_failed()
+
+    def flush_callbacks(self, timeout: float) -> None:
+        with self._condition:
+            target = self._submitted
+            if not self._condition.wait_for(
+                lambda: self._completed >= target or self._error is not None,
+                timeout,
+            ):
+                raise WorkerTerminatedError("message decoder did not flush pending work")
+        self.raise_if_failed()
+
+    def raise_if_failed(self) -> None:
+        with self._condition:
+            error = self._error
+        if error is not None:
+            raise error
+        if (
+            self._thread.ident is not None
+            and not self._thread.is_alive()
+            and not self._stop.is_set()
+        ):
+            raise WorkerTerminatedError("message decoder terminated unexpectedly")
 
     def _run(self) -> None:
         try:
@@ -129,10 +159,17 @@ class DecoderWorker:
                     self.router.route(decode_message(payload), payload)
                 except FrameBackpressureError:
                     raise
-                except BaseException as error:
+                except ValueError as error:
                     self.statistics.add("malformed_packets")
                     LOGGER.debug("malformed MCP payload: %s", error)
+                finally:
+                    with self._condition:
+                        self._completed += 1
+                        self._condition.notify_all()
         except BaseException as error:
+            with self._condition:
+                self._error = error
+                self._condition.notify_all()
             self.router.fail(error)
 
 
@@ -153,6 +190,9 @@ class RawCallbackWorker:
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="mxs-raw-writer", daemon=False)
         self.error: BaseException | None = None
+        self._condition = threading.Condition()
+        self._submitted = 0
+        self._completed = 0
 
     def start(self) -> None:
         self._thread.start()
@@ -162,14 +202,17 @@ class RawCallbackWorker:
         return self._thread.is_alive()
 
     def submit(self, chunk: WireChunk) -> None:
-        if self.error is not None:
-            raise self.error
+        self.raise_if_failed()
         try:
             self.queue.put_nowait(chunk)
+            with self._condition:
+                self._submitted += 1
             self.statistics.maximum("raw_callback_high_water_mark", max(1, self.queue.qsize()))
         except queue.Full as error:
             recording_error = RecordingBackpressureError("raw recording queue overflow")
-            self.error = recording_error
+            with self._condition:
+                self.error = recording_error
+                self._condition.notify_all()
             self.fatal_callback(recording_error)
             raise recording_error from error
 
@@ -178,8 +221,29 @@ class RawCallbackWorker:
         self._thread.join(timeout)
         if self._thread.is_alive():
             raise WorkerTerminatedError("raw recording worker failed to terminate")
-        if self.error is not None:
-            raise self.error
+        self.raise_if_failed()
+
+    def flush_callbacks(self, timeout: float) -> None:
+        with self._condition:
+            target = self._submitted
+            if not self._condition.wait_for(
+                lambda: self._completed >= target or self.error is not None,
+                timeout,
+            ):
+                raise WorkerTerminatedError("raw callback worker did not flush pending work")
+        self.raise_if_failed()
+
+    def raise_if_failed(self) -> None:
+        with self._condition:
+            error = self.error
+        if error is not None:
+            raise error
+        if (
+            self._thread.ident is not None
+            and not self._thread.is_alive()
+            and not self._stop.is_set()
+        ):
+            raise WorkerTerminatedError("raw callback worker terminated unexpectedly")
 
     def _run(self) -> None:
         try:
@@ -188,9 +252,16 @@ class RawCallbackWorker:
                     chunk = self.queue.get(timeout=0.02)
                 except queue.Empty:
                     continue
-                self.callback(chunk)
+                try:
+                    self.callback(chunk)
+                finally:
+                    with self._condition:
+                        self._completed += 1
+                        self._condition.notify_all()
         except BaseException as error:
-            self.error = error
+            with self._condition:
+                self.error = error
+                self._condition.notify_all()
             self.fatal_callback(error)
 
 
@@ -232,6 +303,8 @@ class SerialWorker:
         self._thread = threading.Thread(target=self._run, name=f"mxs-{port}", daemon=False)
         self._open_error: BaseException | None = None
         self._fatal_error: BaseException | None = None
+        self._failure_lock = threading.Lock()
+        self._callback_submission_lock = threading.Lock()
 
     @property
     def alive(self) -> bool:
@@ -256,6 +329,36 @@ class SerialWorker:
             raise SerialOpenError(
                 f"cannot open {self.port}: {self._open_error}"
             ) from self._open_error
+        self.raise_if_failed()
+
+    def flush_callbacks(self, timeout: float) -> None:
+        with self._callback_submission_lock:
+            started = time.monotonic()
+            self.decoder_worker.flush_callbacks(timeout)
+            if self.raw_worker is not None:
+                remaining = max(0.0, timeout - (time.monotonic() - started))
+                self.raw_worker.flush_callbacks(remaining)
+            self.raise_if_failed()
+
+    def raise_if_failed(self) -> None:
+        with self._failure_lock:
+            error = self._fatal_error
+        if error is not None:
+            raise error
+        self.decoder_worker.raise_if_failed()
+        if self.raw_worker is not None:
+            self.raw_worker.raise_if_failed()
+        if self._opened.is_set() and self._stop.is_set():
+            raise WorkerTerminatedError("serial worker termination requested unexpectedly")
+        if self._opened.is_set() and not self.alive and not self._stop.is_set():
+            raise WorkerTerminatedError("serial worker terminated unexpectedly")
+
+    def _record_failure(self, error: BaseException) -> None:
+        with self._failure_lock:
+            if self._fatal_error is None:
+                self._fatal_error = error
+            recorded = self._fatal_error
+        self.router.fail(recorded)
 
     def send(self, packet: bytes, timeout: float = 2.0) -> None:
         request = WriteRequest(packet)
@@ -345,14 +448,15 @@ class SerialWorker:
                     chunk = bytes(memoryview(read_buffer)[:received])
                     timestamp = time.monotonic_ns()
                     self.statistics.add("bytes_received", received)
-                    if self.raw_worker is not None:
-                        self.raw_worker.submit(WireChunk(timestamp, "rx", chunk))
-                    before_classic = self.decoder.statistics.classic_packets
-                    before_noescape = self.decoder.statistics.noescape_packets
-                    before_crc = self.decoder.statistics.crc_errors
-                    before_malformed = self.decoder.statistics.malformed_packets
-                    for payload in self.decoder.feed(chunk):
-                        self.decoder_worker.submit(payload)
+                    with self._callback_submission_lock:
+                        if self.raw_worker is not None:
+                            self.raw_worker.submit(WireChunk(timestamp, "rx", chunk))
+                        before_classic = self.decoder.statistics.classic_packets
+                        before_noescape = self.decoder.statistics.noescape_packets
+                        before_crc = self.decoder.statistics.crc_errors
+                        before_malformed = self.decoder.statistics.malformed_packets
+                        for payload in self.decoder.feed(chunk):
+                            self.decoder_worker.submit(payload)
                     self.statistics.add(
                         "classic_packets", self.decoder.statistics.classic_packets - before_classic
                     )
@@ -369,21 +473,20 @@ class SerialWorker:
                     )
             self._drain_requests(port)
         except FrameBackpressureError as error:
-            self._fatal_error = error
-            self.router.fail(error)
+            self._record_failure(error)
         except (serial.SerialException, OSError) as error:
-            self._fatal_error = DeviceDisconnectedError(str(error))
-            self.router.fail(self._fatal_error)
+            self._record_failure(DeviceDisconnectedError(str(error)))
         except BaseException as error:
-            self._fatal_error = WorkerTerminatedError(str(error))
-            self.router.fail(self._fatal_error)
+            self._record_failure(WorkerTerminatedError(str(error)))
         finally:
             while True:
                 try:
                     request = self._requests.get_nowait()
                 except queue.Empty:
                     break
-                request.error = self._fatal_error or WorkerTerminatedError("serial worker stopped")
+                with self._failure_lock:
+                    fatal_error = self._fatal_error
+                request.error = fatal_error or WorkerTerminatedError("serial worker stopped")
                 request.done.set()
             port.close()
             LOGGER.info("serial worker shut down")
@@ -407,7 +510,10 @@ class SerialWorker:
                         offset += written
                     port.flush()
                     if self.raw_worker is not None:
-                        self.raw_worker.submit(WireChunk(time.monotonic_ns(), "tx", request.packet))
+                        with self._callback_submission_lock:
+                            self.raw_worker.submit(
+                                WireChunk(time.monotonic_ns(), "tx", request.packet)
+                            )
                     self.statistics.add("bytes_transmitted", len(view))
                     LOGGER.debug("TX %s", request.packet.hex(" "))
             except BaseException as error:

@@ -128,14 +128,15 @@ class X4Parameter(IntEnum):
 
 class DeviceState(IntEnum):
     CLOSED = 0
-    OPEN = 1
-    STOPPED = 2
-    MANUAL = 3
-    CONFIGURED = 4
-    STREAMING = 5
-    ERROR = 6
-    CLOSING = 7
-    DESYNCHRONIZED = 8
+    OPENING = 1
+    OPEN = 2
+    STOPPED = 3
+    MANUAL = 4
+    CONFIGURED = 5
+    STREAMING = 6
+    ERROR = 7
+    CLOSING = 8
+    DESYNCHRONIZED = 9
 
 
 CONTENT_ID_RAW_FRAME = 0x00000000

@@ -13,7 +13,9 @@ import pytest
 from mxs import X4M200, AsyncX4M200, CirFrame, X4Config
 from mxs.constants import OutputControl, OutputFeature, ProfileId, SensorMode, SystemInfoCode
 from mxs.errors import (
+    CommandRejectedError,
     InvalidDeviceStateError,
+    ProtocolError,
     UnsafeOperationDisabledError,
     UnsupportedFirmwareError,
 )
@@ -189,6 +191,32 @@ def test_output_exclusivity_uses_live_state(
 
 @pytest.mark.hardware
 @pytest.mark.stateful
+def test_debug_output_behavior_is_live_and_typed(device_port: str) -> None:
+    pairs = (
+        (OutputFeature.BASEBAND_IQ, OutputFeature.BASEBAND_AMPLITUDE_PHASE),
+        (OutputFeature.PULSE_DOPPLER_FLOAT, OutputFeature.PULSE_DOPPLER_BYTE),
+        (OutputFeature.NOISEMAP_FLOAT, OutputFeature.NOISEMAP_BYTE),
+    )
+    outcomes: list[str] = []
+    with X4M200(port=device_port) as device:
+        for first, second in pairs:
+            try:
+                device.outputs.get_debug_output_control(first)
+                device.outputs.get_debug_output_control(second)
+                device.outputs.set_debug_output_control(first, OutputControl.DISABLE)
+                device.outputs.set_debug_output_control(second, OutputControl.DISABLE)
+                device.outputs.set_debug_output_control(first, OutputControl.ENABLE)
+                with pytest.raises(InvalidDeviceStateError, match="mutually exclusive"):
+                    device.outputs.set_debug_output_control(second, OutputControl.ENABLE)
+                device.outputs.set_debug_output_control(first, OutputControl.DISABLE)
+                outcomes.append("supported")
+            except (CommandRejectedError, ProtocolError) as error:
+                outcomes.append(type(error).__name__)
+        assert len(outcomes) == len(pairs)
+
+
+@pytest.mark.hardware
+@pytest.mark.stateful
 def test_five_second_wire_recording_and_replay(device_port: str, tmp_path: Path) -> None:
     path = tmp_path / "live.mcpbin"
     raw_chunks: list[bytes] = []
@@ -239,14 +267,19 @@ def test_all_unsupported_apis_transmit_nothing(device_port: str) -> None:
             lambda: device.noisemap.set_periodic_noisemap_store(1, 0),
             device.noisemap.get_periodic_noisemap_store,
             lambda: device.xep.set_normalization(1),
+            lambda: device.xep.set_normalization(value=1),
             device.xep.get_normalization,
-            lambda: device.xep.set_phase_noise_correction(1),
+            lambda: device.xep.set_phase_noise_correction(1, 0.0),
+            lambda: device.xep.set_phase_noise_correction(enable=1, correction_distance=0.0),
             device.xep.get_phase_noise_correction,
             lambda: device.xep.set_decimation_factor(2),
+            lambda: device.xep.set_decimation_factor(factor=2),
             device.xep.get_decimation_factor,
             lambda: device.xep.set_number_format(1),
+            lambda: device.xep.set_number_format(value=1),
             device.xep.get_number_format,
             lambda: device.xep.set_legacy_output(1),
+            lambda: device.xep.set_legacy_output(value=1),
             device.xep.get_legacy_output,
             lambda: device.unsafe.registers.x4driver_write_to_i2c_register(0, b"\x00"),
             lambda: device.unsafe.registers.x4driver_read_from_i2c_register(1),
@@ -284,8 +317,17 @@ def test_unsafe_operations_stop_before_destructive_tx(
             lambda: device.unsafe.prepare_inject_frame(1, 1, 0),
             lambda: device.unsafe.inject_frame(0, 1, np.zeros(1, dtype=np.float32)),
             lambda: device.unsafe.registers.write_spi(0, b"\x00"),
+            lambda: device.unsafe.registers.x4driver_set_spi_register(0, 0),
+            lambda: device.unsafe.registers.x4driver_set_pif_register(0, 0),
+            lambda: device.unsafe.registers.x4driver_write_to_spi_register(0, b"\x00"),
+            lambda: device.unsafe.registers.x4driver_set_xif_register(0, 0),
             lambda: device.unsafe.filesystem_admin.create_file(0, 0, 0),
+            lambda: device.unsafe.filesystem_admin.open_file(0, 0),
+            lambda: device.unsafe.filesystem_admin.set_file_data(0, 0, 0, b""),
+            lambda: device.unsafe.filesystem_admin.close_file(0, 0, commit=False),
+            lambda: device.unsafe.filesystem_admin.delete_file(0, 0),
             lambda: device.unsafe.filesystem_admin.format_filesystem(key=1),
+            lambda: device.unsafe.filesystem_admin.set_file(0, 0, b""),
             device.noisemap.store_noisemap,
             device.noisemap.delete_noisemap,
         ]

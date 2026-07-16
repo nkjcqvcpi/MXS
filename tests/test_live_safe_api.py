@@ -15,7 +15,9 @@ def test_safe_profile_xep_gpio_noisemap_and_filesystem_surfaces(device_port: str
         assert capabilities.order_code == "X4M200"
         assert device.get_system_info(SystemInfoCode.ORDER_CODE) == "X4M200"
         device.profile.set_sensor_mode(SensorMode.STOP)
+        assert device.profile.get_sensor_mode() is SensorMode.STOP
         device.profile.load_profile(ProfileId.RESPIRATION_2)
+        assert device.profile.get_profileid() == ProfileId.RESPIRATION_2
 
         sensitivity = device.profile.get_sensitivity()
         center_frequency = device.profile.get_tx_center_frequency()
@@ -49,6 +51,7 @@ def test_safe_profile_xep_gpio_noisemap_and_filesystem_surfaces(device_port: str
 
         device.configure(X4Config())
         assert device.xep.x4driver_get_iterations() == 16
+        assert device.xep.x4driver_get_fps() == 0
         assert device.xep.x4driver_get_pulses_per_step() == 300
         assert device.xep.x4driver_get_dac_min() == 949
         assert device.xep.x4driver_get_dac_max() == 1100
@@ -94,15 +97,19 @@ def test_safe_profile_xep_gpio_noisemap_and_filesystem_surfaces(device_port: str
 
 @pytest.mark.hardware
 def test_safe_optional_reads_fail_typed_when_firmware_rejects(device_port: str) -> None:
+    failures = (CommandRejectedError, CommandTimeoutError, ProtocolError)
     with X4M200(port=device_port) as device:
-        failures = (CommandRejectedError, CommandTimeoutError, ProtocolError)
-        for call in (
+        calls = (
             lambda: device.parameters.get_parameter_file("profile.par"),
             lambda: device.unsafe.registers.x4driver_get_spi_register(0),
             lambda: device.unsafe.registers.x4driver_get_pif_register(0),
             lambda: device.unsafe.registers.x4driver_get_xif_register(0),
-        ):
+            lambda: device.unsafe.registers.x4driver_read_from_spi_register(0, 1),
+        )
+        outcomes: list[object] = []
+        for call in calls:
             try:
-                call()
-            except failures:
-                break
+                outcomes.append(call())
+            except failures as error:
+                outcomes.append(type(error))
+        assert len(outcomes) == len(calls)

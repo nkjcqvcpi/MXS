@@ -2,6 +2,7 @@
 
 import os
 import struct
+import time
 from collections.abc import Generator
 from contextlib import contextmanager, suppress
 from typing import ClassVar, Never
@@ -66,7 +67,12 @@ from ..constants import (
     SystemInfoCode,
     X4Parameter,
 )
-from ..errors import InvalidDeviceStateError, UnsafeOperationDisabledError, UnsupportedFirmwareError
+from ..errors import (
+    InvalidDeviceStateError,
+    ProtocolError,
+    UnsafeOperationDisabledError,
+    UnsupportedFirmwareError,
+)
 from ..expectations import ACK, PONG, ResponseExpectation, reply
 from ..models import (
     ByteReply,
@@ -132,7 +138,7 @@ class Interface:
         result = self._reply(
             "unsafe_get_sensor_mode",
             build_get_sensor_mode(),
-            reply(ByteReply, 0, element_count=1),
+            reply(ByteReply, content_ids={0, 0x26}, element_count=1),
         )
         assert isinstance(result, ByteReply)
         sensor_mode = SensorMode(result.values[0])
@@ -191,7 +197,7 @@ class ModuleInterface(Interface):
         result = self._reply(
             "get_system_info",
             build_system_info(code),
-            reply(StringReply, 0x58, info=code),
+            reply(StringReply, content_ids={0, 0x58}, info=code),
         )
         assert isinstance(result, StringReply)
         return result.value
@@ -214,20 +220,47 @@ class ProfileInterface(Interface):
             self._ack("load_profile", build_load_profile(profile_id))
             self._session.invalidate_output_state()
 
+    def restore_profile(self, profile_id: int) -> None:
+        """Restore a profile, using reset as the source-backed no-profile operation."""
+        with self._session.operation_lock:
+            self.set_sensor_mode(SensorMode.STOP)
+            actual = self.get_profileid()
+            if profile_id == 0 and actual != 0:
+                # X4M200.hpp defines zero only as the observed no-profile state. It does not
+                # document load_profile(0). Its reset() contract explicitly reconnects after
+                # unloading the application, so use that authoritative path and verify it.
+                self._ack("restore_no_profile", build_module_reset())
+                self._session.close_passive()
+                time.sleep(0.2)
+                self._session.open()
+                self.set_sensor_mode(SensorMode.STOP)
+            elif profile_id != 0 and actual != profile_id:
+                self.load_profile(profile_id)
+                self.set_sensor_mode(SensorMode.STOP)
+            actual = self.get_profileid()
+            if actual != profile_id:
+                raise ProtocolError(
+                    f"profile restoration failed: expected 0x{profile_id:08x}, got 0x{actual:08x}"
+                )
+
     def set_sensor_mode(self, mode: SensorMode | int, param: int = 0) -> None:
         with self._session.operation_lock:
             self._ack("set_sensor_mode", build_set_sensor_mode(SensorMode(mode), param))
 
     def get_sensor_mode(self) -> SensorMode:
         result = self._reply(
-            "get_sensor_mode", build_get_sensor_mode(), reply(ByteReply, 0, element_count=1)
+            "get_sensor_mode",
+            build_get_sensor_mode(),
+            reply(ByteReply, content_ids={0, 0x26}, element_count=1),
         )
         assert isinstance(result, ByteReply)
         return SensorMode(result.values[0])
 
     def get_profileid(self) -> int:
         result = self._reply(
-            "get_profileid", build_filesystem(0x74), reply(IntReply, 0, element_count=1)
+            "get_profileid",
+            build_filesystem(0x74),
+            reply(IntReply, content_ids={0, 0x74}, element_count=1),
         )
         assert isinstance(result, IntReply)
         return int(result.values[0])
@@ -244,7 +277,7 @@ class ProfileInterface(Interface):
         result = self._reply(
             "get_sensitivity",
             build_app_get(CONTENT_ID_SENSITIVITY),
-            reply(IntReply, 0, element_count=1),
+            reply(IntReply, content_ids={0, CONTENT_ID_SENSITIVITY}, element_count=1),
         )
         assert isinstance(result, IntReply)
         return int(result.values[0])
@@ -261,7 +294,7 @@ class ProfileInterface(Interface):
         result = self._reply(
             "get_tx_center_frequency",
             build_app_get(CONTENT_ID_TX_CENTER_FREQUENCY),
-            reply(IntReply, 0, element_count=1),
+            reply(IntReply, content_ids={0, CONTENT_ID_TX_CENTER_FREQUENCY}, element_count=1),
         )
         assert isinstance(result, IntReply)
         return int(result.values[0])
@@ -273,7 +306,7 @@ class ProfileInterface(Interface):
         result = self._reply(
             "get_detection_zone",
             build_app_get(CONTENT_ID_DETECTION_ZONE),
-            reply(FloatReply, 0, element_count=2),
+            reply(FloatReply, content_ids={0, CONTENT_ID_DETECTION_ZONE}, element_count=2),
         )
         assert isinstance(result, FloatReply)
         return DetectionZone(float(result.values[0]), float(result.values[1]))
@@ -282,7 +315,7 @@ class ProfileInterface(Interface):
         result = self._reply(
             "get_detection_zone_limits",
             build_app_get(CONTENT_ID_DETECTION_ZONE_LIMITS),
-            reply(FloatReply, 0, element_count=3),
+            reply(FloatReply, content_ids={0, CONTENT_ID_DETECTION_ZONE_LIMITS}, element_count=3),
         )
         assert isinstance(result, FloatReply)
         return DetectionZoneLimits(*(float(value) for value in result.values))
@@ -294,7 +327,7 @@ class ProfileInterface(Interface):
         result = self._reply(
             "get_led_control",
             build_app_get(CONTENT_ID_LED_CONTROL),
-            reply(ByteReply, 0, element_count=1),
+            reply(ByteReply, content_ids={0, CONTENT_ID_LED_CONTROL}, element_count=1),
         )
         assert isinstance(result, ByteReply)
         return result.values[0]
@@ -308,46 +341,64 @@ class OutputsInterface(Interface):
     )
 
     def set_output_control(self, feature: int, control: int) -> None:
+        self._set_output_control(feature, control, debug=False)
+
+    def get_output_control(self, feature: int) -> int:
+        return self._get_output_control(feature, debug=False)
+
+    def _get_output_control_locked(self, feature: int, *, debug: bool) -> int:
+        result = self._reply(
+            "get_debug_output_control" if debug else "get_output_control",
+            build_get_output_control(feature, debug=debug),
+            reply(IntReply, content_ids={0, feature}, element_count=1),
+        )
+        assert isinstance(result, IntReply)
+        value = int(result.values[0])
+        self._session.output_state_cache[(debug, feature)] = value
+        return value
+
+    def _synchronize_group(self, group: frozenset[int], *, debug: bool) -> None:
+        for related in group:
+            self._get_output_control_locked(related, debug=debug)
+
+    def _set_output_control(self, feature: int, control: int, *, debug: bool) -> None:
         feature = int(feature)
         self._require_supported_feature(feature)
         with self._session.operation_lock:
             group = next((pair for pair in self._EXCLUSIVE if feature in pair), None)
             if group is not None:
-                self._synchronize_group(group)
+                self._synchronize_group(group, debug=debug)
                 if control and any(
-                    self._session.output_state_cache[related]
+                    self._session.output_state_cache[(debug, related)]
                     for related in group
                     if related != feature
                 ):
                     raise InvalidDeviceStateError(
                         "cannot enable a mutually exclusive output while another member is enabled"
                     )
-            self._ack("set_output_control", build_set_output_control(feature, control))
+            self._ack(
+                "set_debug_output_control" if debug else "set_output_control",
+                build_set_output_control(feature, control, debug=debug),
+            )
             if group is None:
-                self._session.output_state_cache[feature] = int(control)
-            else:
-                self._synchronize_group(group)
+                self._session.output_state_cache[(debug, feature)] = int(control)
+                return
+            try:
+                self._synchronize_group(group, debug=debug)
+                enabled = sum(
+                    bool(self._session.output_state_cache[(debug, related)]) for related in group
+                )
+                if enabled > 1:
+                    raise ProtocolError("firmware violated mutually exclusive output postcondition")
+            except BaseException:
+                self._session.invalidate_output_state()
+                raise
 
-    def get_output_control(self, feature: int) -> int:
+    def _get_output_control(self, feature: int, *, debug: bool) -> int:
         feature = int(feature)
         self._require_supported_feature(feature)
         with self._session.operation_lock:
-            return self._get_output_control_locked(feature)
-
-    def _get_output_control_locked(self, feature: int) -> int:
-        result = self._reply(
-            "get_output_control",
-            build_get_output_control(feature),
-            reply(IntReply, 0, element_count=1),
-        )
-        assert isinstance(result, IntReply)
-        value = int(result.values[0])
-        self._session.output_state_cache[feature] = value
-        return value
-
-    def _synchronize_group(self, group: frozenset[int]) -> None:
-        for related in group:
-            self._get_output_control_locked(related)
+            return self._get_output_control_locked(feature, debug=debug)
 
     @staticmethod
     def _require_supported_feature(feature: int) -> None:
@@ -357,24 +408,10 @@ class OutputsInterface(Interface):
             )
 
     def set_debug_output_control(self, feature: int, control: int) -> None:
-        feature = int(feature)
-        self._require_supported_feature(feature)
-        with self._session.operation_lock:
-            self._ack(
-                "set_debug_output_control", build_set_output_control(feature, control, debug=True)
-            )
+        self._set_output_control(feature, control, debug=True)
 
     def get_debug_output_control(self, feature: int) -> int:
-        feature = int(feature)
-        self._require_supported_feature(feature)
-        with self._session.operation_lock:
-            result = self._reply(
-                "get_debug_output_control",
-                build_get_output_control(feature, debug=True),
-                reply(IntReply, 0, element_count=1),
-            )
-            assert isinstance(result, IntReply)
-            return int(result.values[0])
+        return self._get_output_control(feature, debug=True)
 
 
 class XepInterface(Interface):
@@ -402,7 +439,7 @@ class XepInterface(Interface):
         result = self._reply(
             f"x4driver_get_{parameter_id:02x}",
             build_x4_get(parameter_id),
-            reply(cls, parameter_id, element_count=count),
+            reply(cls, content_ids={0, parameter_id}, element_count=count),
         )
         if isinstance(result, ByteReply):
             return result.values[0] if count == 1 else result.values
@@ -459,19 +496,44 @@ class XepInterface(Interface):
     def x4driver_set_prf_div(self, value: int) -> None:
         self._ack("x4driver_set_prf_div", build_set_prf_div(value))
 
-    def _unsupported_xep_control(self, *_args: object) -> Never:
+    @staticmethod
+    def _unsupported_xep_control() -> Never:
         raise UnsupportedFirmwareError("XEP control has no wire producer in local Legacy-SW")
 
-    set_normalization = _unsupported_xep_control
-    get_normalization = _unsupported_xep_control
-    set_phase_noise_correction = _unsupported_xep_control
-    get_phase_noise_correction = _unsupported_xep_control
-    set_decimation_factor = _unsupported_xep_control
-    get_decimation_factor = _unsupported_xep_control
-    set_number_format = _unsupported_xep_control
-    get_number_format = _unsupported_xep_control
-    set_legacy_output = _unsupported_xep_control
-    get_legacy_output = _unsupported_xep_control
+    def set_normalization(self, value: int) -> Never:
+        del value
+        return self._unsupported_xep_control()
+
+    def get_normalization(self) -> Never:
+        return self._unsupported_xep_control()
+
+    def set_phase_noise_correction(self, enable: int, correction_distance: float) -> Never:
+        del enable, correction_distance
+        return self._unsupported_xep_control()
+
+    def get_phase_noise_correction(self) -> Never:
+        return self._unsupported_xep_control()
+
+    def set_decimation_factor(self, factor: int) -> Never:
+        del factor
+        return self._unsupported_xep_control()
+
+    def get_decimation_factor(self) -> Never:
+        return self._unsupported_xep_control()
+
+    def set_number_format(self, value: int) -> Never:
+        del value
+        return self._unsupported_xep_control()
+
+    def get_number_format(self) -> Never:
+        return self._unsupported_xep_control()
+
+    def set_legacy_output(self, value: int) -> Never:
+        del value
+        return self._unsupported_xep_control()
+
+    def get_legacy_output(self) -> Never:
+        return self._unsupported_xep_control()
 
     def x4driver_set_fps(self, value: float) -> None:
         self._ack("x4driver_set_fps", build_set_fps(value))
@@ -530,7 +592,7 @@ class GpioInterface(Interface):
         result = self._reply(
             "get_iopin_control",
             build_get_iopin_control(self._pin(pin)),
-            reply(IntReply, 0, element_count=2),
+            reply(IntReply, content_ids={0, self._pin(pin)}, element_count=2),
         )
         assert isinstance(result, IntReply)
         return IoPinSetup(int(result.values[0])), IoPinFeature(int(result.values[1]))
@@ -544,7 +606,7 @@ class GpioInterface(Interface):
         result = self._reply(
             "get_iopin_value",
             build_get_iopin_value(self._pin(pin)),
-            reply(IntReply, 0x21, element_count=1),
+            reply(IntReply, content_ids={0, 0x21, self._pin(pin)}, element_count=1),
         )
         assert isinstance(result, IntReply)
         return int(result.values[0])
@@ -573,7 +635,9 @@ class NoisemapInterface(Interface):
 
     def get_noisemap_control(self) -> int:
         result = self._reply(
-            "get_noisemap_control", build_noisemap(0x11), reply(IntReply, 0, element_count=1)
+            "get_noisemap_control",
+            build_noisemap(0x11),
+            reply(IntReply, content_ids={0, 0x11}, element_count=1),
         )
         assert isinstance(result, IntReply)
         return int(result.values[0])
@@ -592,7 +656,9 @@ class NoisemapInterface(Interface):
 class ParametersInterface(Interface):
     def get_parameter_file(self, filename: str) -> bytes:
         result = self._reply(
-            "get_parameter_file", build_parameter_file(filename), reply(ByteReply, 0x32BA7623)
+            "get_parameter_file",
+            build_parameter_file(filename),
+            reply(ByteReply, content_ids={0, 0x32BA7623}),
         )
         assert isinstance(result, ByteReply)
         return result.values
@@ -615,7 +681,9 @@ class FilesystemInterface(Interface):
 
     def _search_for_file_by_type_unlocked(self, file_type: int) -> list[FileIdentifier]:
         result = self._reply(
-            "search_for_file_by_type", build_filesystem(0x64, file_type), reply(IntReply, 0)
+            "search_for_file_by_type",
+            build_filesystem(0x64, file_type),
+            reply(IntReply, content_ids={0, 0x64}),
         )
         assert isinstance(result, IntReply)
         return [FileIdentifier(file_type, int(value)) for value in result.values]
@@ -625,7 +693,9 @@ class FilesystemInterface(Interface):
             return self._find_all_files_unlocked()
 
     def _find_all_files_unlocked(self) -> list[FileIdentifier]:
-        result = self._reply("find_all_files", build_filesystem(0x65), reply(IntReply, 0))
+        result = self._reply(
+            "find_all_files", build_filesystem(0x65), reply(IntReply, content_ids={0, 0x65})
+        )
         assert isinstance(result, IntReply)
         count = result.element_count // 2
         return [
@@ -641,7 +711,7 @@ class FilesystemInterface(Interface):
         result = self._reply(
             "get_file_length",
             build_filesystem(0x69, file_type, identifier),
-            reply(IntReply, 0, element_count=1),
+            reply(IntReply, content_ids={0, 0x69}, element_count=1),
         )
         assert isinstance(result, IntReply)
         return int(result.values[0])
@@ -661,7 +731,7 @@ class FilesystemInterface(Interface):
             reply_value = self._reply(
                 "get_file_data",
                 build_filesystem(0x71, file_type, identifier, position, count),
-                reply(ByteReply, 0, element_count=count),
+                reply(ByteReply, content_ids={0, 0x71}, element_count=count),
             )
             assert isinstance(reply_value, ByteReply)
             result.extend(reply_value.values)
@@ -703,7 +773,9 @@ class UnsafeInterface(Interface):
             allowed_states={DeviceState.OPEN, DeviceState.STOPPED},
         ):
             result = self._reply(
-                "system_run_test", build_system_test(test_code), reply(ByteReply, 0x5090)
+                "system_run_test",
+                build_system_test(test_code),
+                reply(ByteReply, content_ids={0, 0x5090}),
             )
             assert isinstance(result, ByteReply)
             return result.values
@@ -756,7 +828,11 @@ class RegisterInterface(Interface):
         result = self._reply(
             "x4driver_get_spi_register",
             build_x4_get(X4Parameter.SPI_REGISTER, bytes((address,))),
-            reply(ByteReply, int(X4Parameter.SPI_REGISTER), element_count=1),
+            reply(
+                ByteReply,
+                content_ids={0, int(X4Parameter.SPI_REGISTER)},
+                element_count=1,
+            ),
         )
         assert isinstance(result, ByteReply)
         return result.values[0]
@@ -783,7 +859,7 @@ class RegisterInterface(Interface):
         result = self._reply(
             f"get_{parameter.name.lower()}",
             build_x4_get(parameter, bytes((address,))),
-            reply(ByteReply, int(parameter), element_count=1),
+            reply(ByteReply, content_ids={0, int(parameter)}, element_count=1),
         )
         assert isinstance(result, ByteReply)
         return result.values[0]
@@ -808,7 +884,11 @@ class RegisterInterface(Interface):
         result = self._reply(
             "read_spi",
             build_x4_read(X4Parameter.SPI_REGISTER, bytes((address,)) + struct.pack("<I", length)),
-            reply(ByteReply, int(X4Parameter.SPI_REGISTER), element_count=length),
+            reply(
+                ByteReply,
+                content_ids={0, int(X4Parameter.SPI_REGISTER)},
+                element_count=length,
+            ),
         )
         assert isinstance(result, ByteReply)
         return result.values

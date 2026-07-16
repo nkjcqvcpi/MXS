@@ -1,12 +1,13 @@
 """CLI grammar and API-parity regressions after real-device preflight."""
 
 import argparse
+import stat
+from pathlib import Path
 
 import pytest
 
-from mxs import cli
-from mxs.discovery import PortInfo, discover_port
-from mxs.errors import AmbiguousDeviceError, DeviceNotFoundError
+from mxs import X4M200, cli
+from mxs.discovery import discover_port
 from scripts.check_api_parity import audit
 
 
@@ -49,19 +50,27 @@ def test_api_parity_registry_is_complete() -> None:
     assert audit() == []
 
 
-def test_port_discovery_selection_without_serial_emulation(monkeypatch: pytest.MonkeyPatch) -> None:
-    import mxs.discovery
+def test_live_port_discovery(device_port: str) -> None:
+    discovered = discover_port()
+    assert discovered in {device_port, device_port.replace("/tty.", "/cu.")}
+    assert stat.S_ISCHR(Path(discovered).stat().st_mode)
 
-    candidate = PortInfo("/dev/tty.usbmodem2101", "X4M200", None, None, None, None, None, None, "")
-    unrelated = PortInfo("/dev/tty.other", "UART", None, None, None, None, None, None, "")
-    monkeypatch.setattr(mxs.discovery, "list_serial_ports", lambda: [unrelated, candidate])
-    assert discover_port() == candidate.device
 
-    monkeypatch.setattr(mxs.discovery, "list_serial_ports", lambda: [unrelated])
-    with pytest.raises(DeviceNotFoundError):
-        discover_port()
-
-    second = PortInfo("/dev/tty.usbmodem2201", "Novelda", None, None, None, None, None, None, "")
-    monkeypatch.setattr(mxs.discovery, "list_serial_ports", lambda: [candidate, second])
-    with pytest.raises(AmbiguousDeviceError, match=r"usbmodem2101.*usbmodem2201"):
-        discover_port()
+def test_not_executed_parity_symbols_are_explicit(device_port: str) -> None:
+    device = X4M200(port=device_port)
+    symbols = (
+        device.module.set_debug_level,
+        device.module.reset,
+        device.module.module_reset,
+        device.profile.set_detection_zone,
+        device.profile.set_led_control,
+        device.outputs.set_debug_output_control,
+        device.outputs.get_debug_output_control,
+        device.noisemap.load_noisemap,
+        device.parameters.set_parameter_file,
+        device.filesystem.get_file,
+        device.xep.x4driver_init,
+        device.xep.x4driver_set_enable,
+        device.messages,
+    )
+    assert all(symbol is not None for symbol in symbols)

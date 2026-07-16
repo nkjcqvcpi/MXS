@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.5 - 2026-07-16
+
+- Add an explicit `OPENING` state and prevent asynchronous serial, decoder, callback, recorder, or worker-termination failures from being overwritten by `OPEN`.
+- Flush callback work submitted during baud probing and require every owned worker to remain healthy before accepting a candidate.
+- Accept both source-defined and observed Annapurna 1.6.6 reply content IDs while retaining strict datatype, info, element-count, element-size, and payload-length validation.
+- Enforce all three output-exclusivity pairs through one normal/debug transaction with preflight conflict rejection and postcondition verification.
+- Restore baseline profile ID `0` through verified no-profile state or source-backed module reset, then verify outputs, STOP, 115200 baud, PING, and worker shutdown.
+- Replace synthetic firmware, fake router, and fake discovery tests with mutations of packets captured from the connected X4M200.
+- Require explicit method-level API-parity evidence and verify that each cited pytest node directly references its documented API symbol.
+- Give every unsupported method an explicit documented signature and verify positional and keyword calls raise `UnsupportedFirmwareError` without transmission.
+
 ## 0.2.4 - 2026-07-15
 
 - Serialize every structured interface command through the session operation lock, including complete filesystem and output-state transactions.

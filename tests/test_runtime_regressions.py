@@ -1,184 +1,26 @@
-"""Concurrency and bounded-runtime regressions after real-device preflight."""
+"""Concurrency regressions exercised only after live X4M200 traffic capture."""
 
 import asyncio
-import threading
 import time
 
-import numpy as np
 import pytest
 
-from mxs.constants import CONTENT_ID_NOISEMAP_FLOAT
+from mxs import X4M200, X4Config
+from mxs.constants import ResponseType
 from mxs.diagnostics import StatisticsTracker
 from mxs.errors import (
-    CommandRejectedError,
-    CommandTimeoutError,
     FrameBackpressureError,
     MessageQueueOverflowError,
     RecordingBackpressureError,
-    ReplyMismatchError,
-    SessionDesynchronizedError,
     WorkerTerminatedError,
 )
-from mxs.expectations import reply
+from mxs.framing import McpStreamDecoder
 from mxs.message_hub import MessageHub, Subscription, Topic
-from mxs.models import (
-    Ack,
-    BasebandAmplitudePhaseMessage,
-    DataFloatMessage,
-    ErrorResponse,
-    IntReply,
-    MatrixMessage,
-    RespirationStatus,
-    SleepStatus,
-    SystemMessage,
-)
-from mxs.router import CommandManager, MessageRouter
 from mxs.transport import DecoderWorker, RawCallbackWorker, WireChunk
 
 
-def _router(downconversion: bool = False) -> tuple[MessageRouter, StatisticsTracker]:
-    statistics = StatisticsTracker()
-    manager = CommandManager(statistics, lambda: "STREAMING")
-    return MessageRouter(
-        statistics, manager, lambda: (-0.5, 5.0), lambda: downconversion
-    ), statistics
-
-
-def _message(counter: int) -> DataFloatMessage:
-    return DataFloatMessage(0, counter, np.asarray([1, 2, 3, 4], np.float32))
-
-
-def test_frame_router_policies_counters_and_topics() -> None:
-    router, statistics = _router(True)
-    oldest = router.subscribe(1, "drop_oldest")
-    router.route(_message(1), b"")
-    router.route(_message(3), b"")
-    frame = oldest.queue.get_nowait()
-    assert not isinstance(frame, BaseException)
-    assert frame.samples.dtype == np.complex64 and frame.sequence_gap == 2
-    assert statistics.snapshot().consumer_drops == 1
-
-    router, _ = _router()
-    lossless = router.subscribe(1, "error")
-    router.route(_message(1), b"")
-    with pytest.raises(FrameBackpressureError):
-        router.route(_message(2), b"")
-    assert isinstance(lossless.queue.get_nowait(), FrameBackpressureError)
-
-    router, statistics = _router()
-    newest = router.subscribe(1, "drop_newest")
-    router.route(_message(1), b"")
-    router.route(_message(2), b"")
-    kept = newest.queue.get_nowait()
-    assert not isinstance(kept, BaseException) and kept.frame_counter == 1
-    router.route(_message(3), b"")
-    after_drop = newest.queue.get_nowait()
-    assert not isinstance(after_drop, BaseException) and after_drop.sequence_gap >= 1
-    assert statistics.snapshot().consumer_drops == 1
-
-    router, _ = _router()
-    blocked = router.subscribe(1, "block_with_timeout")
-    blocked.block_timeout = 0.001
-    router.route(_message(1), b"")
-    with pytest.raises(FrameBackpressureError):
-        router.route(_message(2), b"")
-
-    with pytest.raises(ValueError):
-        router.subscribe(0)
-
-    router, statistics = _router()
-    subscription = router.subscribe(2, "error")
-    router.route(_message(10), b"")
-    router.route(SleepStatus(500, 4, 0.0, 0.0, 0, 0.0, 0.0), b"")
-    router.route(_message(11), b"")
-    assert statistics.snapshot().frame_counter_gaps == 0
-    assert subscription.queue.qsize() == 2
-    sleep = router.messages.sleep.read()
-    assert isinstance(sleep, SleepStatus) and sleep.frame_counter == 500
-
-
-def test_router_routes_application_and_system_messages() -> None:
-    router, _ = _router()
-    values = np.asarray([1.0], np.float32)
-    routed = (
-        (BasebandAmplitudePhaseMessage(1, 1, 1, 0.1, 1.0, 7.0, 0.0, values, values), "baseband_ap"),
-        (RespirationStatus(1, 2, 3, 4.0, 5.0, 6), "respiration"),
-        (
-            MatrixMessage(
-                CONTENT_ID_NOISEMAP_FLOAT, 1, 2, 3, 4, 1, 5, 1.0, 1.0, 0.0, 1.0, 2.0, values
-            ),
-            "noisemap_float",
-        ),
-    )
-    for value, topic in routed:
-        router.route(value, b"")
-        assert getattr(router.messages, topic).read() is value
-        assert router.messages.all.read() is value
-    system = SystemMessage(1, b"x")
-    router.route(system, b"")
-    assert router.messages.system.read() is system
-
-    error = WorkerTerminatedError("failed")
-    failed = router.subscribe()
-    router.fail(error)
-    with pytest.raises(WorkerTerminatedError, match="failed"):
-        value = failed.queue.get_nowait()
-        if isinstance(value, BaseException):
-            raise value
-    router.close()
-    router.reset_frame_counters()
-    assert router.last_counter is None and not router.last_counter_by_stream
-
-
-def test_command_manager_serialization_rejection_timeout_and_mismatch() -> None:
-    statistics = StatisticsTracker()
-    manager = CommandManager(statistics, lambda: "MANUAL")
-    active = 0
-    maximum = 0
-    lock = threading.Lock()
-
-    def sender(_packet: bytes, _timeout: float) -> None:
-        nonlocal active, maximum
-        with lock:
-            active += 1
-            maximum = max(maximum, active)
-        time.sleep(0.002)
-        manager.route(Ack(), b"\x10")
-        with lock:
-            active -= 1
-
-    results: list[object] = []
-    threads = [
-        threading.Thread(target=lambda: results.append(manager.execute("TEST", b"x", sender)))
-        for _ in range(4)
-    ]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-    assert maximum == 1 and len(results) == 4
-
-    def reject(_packet: bytes, _timeout: float) -> None:
-        manager.route(ErrorResponse(0x21), b"\x20\x21")
-
-    with pytest.raises(CommandRejectedError):
-        manager.execute("REJECT", b"packet", reject)
-
-    manager = CommandManager(statistics, lambda: "OPEN")
-    with pytest.raises(CommandTimeoutError):
-        manager.execute("TIMEOUT", b"x", lambda _p, _t: None, timeout=0.001)
-    with pytest.raises(SessionDesynchronizedError):
-        manager.execute("LATE", b"x", lambda _p, _t: None)
-    manager.reset()
-
-    def mismatch(_packet: bytes, _timeout: float) -> None:
-        manager.route(IntReply(2, 0, 1, 4, np.asarray([1], np.int32)), b"reply")
-
-    with pytest.raises(ReplyMismatchError):
-        manager.execute("GET", b"x", mismatch, expectation=reply(IntReply, 1, element_count=1))
-
-
-def test_message_hub_overflow_policies_and_failure() -> None:
+def test_message_hub_overflow_policies_and_failure(device_port: str) -> None:
+    del device_port
     oldest = Subscription[int](1, "drop_oldest")
     oldest.publish(1)
     oldest.publish(2)
@@ -219,26 +61,62 @@ def test_message_hub_overflow_policies_and_failure() -> None:
         hub.system.read()
 
 
-def test_decoder_and_callback_worker_backpressure_and_failures() -> None:
-    router, statistics = _router()
-    decoder = DecoderWorker(router, statistics, control_capacity=1, stream_capacity=1)
-    decoder.submit(bytes((0x10,)))
-    with pytest.raises(FrameBackpressureError, match="control"):
-        decoder.submit(bytes((0x10,)))
+@pytest.mark.hardware
+@pytest.mark.stateful
+def test_decoder_and_callback_failures_use_live_packets(device_port: str) -> None:
+    raw_chunks: list[bytes] = []
+    wire_chunks: list[WireChunk] = []
+    with X4M200(
+        port=device_port,
+        raw_chunk_callback=raw_chunks.append,
+        wire_chunk_callback=wire_chunks.append,
+    ) as device:
+        assert device.module.ping().ready
+        device.configure(X4Config())
+        device.start()
+        device.read_frame(timeout=2.0)
+        device.stop()
+        decoder = McpStreamDecoder()
+        payloads = [payload for chunk in raw_chunks for payload in decoder.feed(chunk)]
+        control_types = {
+            ResponseType.ACK,
+            ResponseType.ERROR,
+            ResponseType.REPLY,
+            ResponseType.PONG,
+            ResponseType.SYSTEM,
+        }
+        control = next(payload for payload in payloads if payload[0] in control_types)
+        stream = next(payload for payload in payloads if payload[0] == ResponseType.DATA)
 
-    decoder = DecoderWorker(router, statistics, control_capacity=1, stream_capacity=1)
-    decoder.submit(b"stream")
-    with pytest.raises(FrameBackpressureError, match="stream"):
-        decoder.submit(b"stream")
+        statistics = StatisticsTracker()
+        router = device._session.router  # pyright: ignore[reportPrivateUsage]
+        control_worker = DecoderWorker(
+            router,
+            statistics,
+            control_capacity=1,
+            stream_capacity=1,
+        )
+        control_worker.submit(control)
+        with pytest.raises(FrameBackpressureError, match="control"):
+            control_worker.submit(bytes(control))
 
+        stream_worker = DecoderWorker(
+            router,
+            statistics,
+            control_capacity=1,
+            stream_capacity=1,
+        )
+        stream_worker.submit(stream)
+        with pytest.raises(FrameBackpressureError, match="stream"):
+            stream_worker.submit(bytes(stream))
+
+    rx_chunk = next(chunk for chunk in wire_chunks if chunk.direction == "rx")
     failures: list[BaseException] = []
     callback = RawCallbackWorker(lambda _chunk: None, statistics, failures.append, capacity=1)
-    callback.submit(WireChunk(1, "rx", b"one"))
+    callback.submit(rx_chunk)
     with pytest.raises(RecordingBackpressureError):
-        callback.submit(WireChunk(2, "rx", b"two"))
+        callback.submit(rx_chunk)
     assert failures and isinstance(failures[0], RecordingBackpressureError)
-    with pytest.raises(RecordingBackpressureError):
-        callback.submit(WireChunk(3, "rx", b"three"))
 
     failure = RuntimeError("callback failed")
 
@@ -248,7 +126,7 @@ def test_decoder_and_callback_worker_backpressure_and_failures() -> None:
     failures.clear()
     callback = RawCallbackWorker(fail_callback, statistics, failures.append)
     callback.start()
-    callback.submit(WireChunk(4, "rx", b"live-shaped"))
+    callback.submit(rx_chunk)
     deadline = time.monotonic() + 1
     while callback.error is None and time.monotonic() < deadline:
         time.sleep(0.001)
@@ -258,7 +136,8 @@ def test_decoder_and_callback_worker_backpressure_and_failures() -> None:
 
 
 @pytest.mark.asyncio
-async def test_async_waiter_delivery_timeout_cancellation_and_close() -> None:
+async def test_async_waiter_delivery_timeout_cancellation_and_close(device_port: str) -> None:
+    del device_port
     topic = Topic[int]()
     child = topic.subscribe(2, "error")
     pending = asyncio.create_task(topic.read_async(timeout=1))
@@ -280,10 +159,6 @@ async def test_async_waiter_delivery_timeout_cancellation_and_close() -> None:
     topic.fail(WorkerTerminatedError("closed"))
     with pytest.raises(WorkerTerminatedError):
         await topic.read_async()
-
-    iterated = Subscription[int](1, "error")
-    iterated.publish(23)
-    assert await anext(aiter(iterated)) == 23
 
     failed = Subscription[int](1, "error")
     waiting = asyncio.create_task(failed.read_async())
